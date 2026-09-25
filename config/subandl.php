@@ -48,6 +48,41 @@ return [
     // A running backup/update flag older than this is treated as a dead run.
     'stale_minutes' => 30,
 
+    // Guarantee at least one successful backup every 24 hours, even when the
+    // customer's automatic backup toggle is off. While overdue, a failed
+    // attempt is retried every backup_daily_retry_minutes.
+    'backup_daily_minimum' => true,
+    'backup_daily_retry_minutes' => 60,
+
+    // false: the scheduler only CHECKS for a new version and the widget's
+    // modal lets the customer apply it. true: install it unattended.
+    'update_auto_apply' => false,
+
+    /*
+    |--------------------------------------------------------------------------
+    | Global widget
+    |--------------------------------------------------------------------------
+    | Injected into every HTML page of the web group (no host code needed): an
+    | edge tab that opens an offcanvas panel with the payment reminder (only
+    | while an amount is due), the version/update status and the backup
+    | status, plus a modal whenever a newer version is available.
+    */
+    'widget' => [
+        'enabled' => true,
+
+        // Request::is patterns where the widget stays hidden.
+        'hidden_on' => ['login', 'register', 'password/*', 'subscription', 'subscription/*', 'license/*', 'terms'],
+
+        // "Remind me later" on the payment reminder hides it for this long.
+        'reminder_minutes' => 10,
+
+        // "Later" on the update modal hides it for this long (per version).
+        'update_snooze_hours' => 6,
+
+        // Optional lines shown above the amount due, e.g. a greeting.
+        'payment_greeting' => [],
+    ],
+
     /*
     |--------------------------------------------------------------------------
     | Database tables

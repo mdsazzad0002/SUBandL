@@ -8,6 +8,7 @@ use Illuminate\Support\Facades\Route;
 use Illuminate\Support\ServiceProvider;
 use SUBandL\Contracts\AccessResolver;
 use SUBandL\Http\Middleware\EnsureLicenseValid;
+use SUBandL\Http\Middleware\InjectWidget;
 use SUBandL\Http\Middleware\RunScheduledTasks;
 
 class SUBandLServiceProvider extends ServiceProvider
@@ -79,6 +80,7 @@ class SUBandLServiceProvider extends ServiceProvider
         $router = $this->app['router'];
         $router->aliasMiddleware('subandl.license', EnsureLicenseValid::class);
         $router->aliasMiddleware('subandl.scheduler', RunScheduledTasks::class);
+        $router->aliasMiddleware('subandl.widget', InjectWidget::class);
 
         if (! config('subandl.middleware.auto_register', true)) {
             return;
@@ -90,7 +92,7 @@ class SUBandLServiceProvider extends ServiceProvider
         $group = (string) config('subandl.middleware.group', 'web');
         $kernel = $this->app->make(HttpKernel::class);
 
-        foreach ([EnsureLicenseValid::class, RunScheduledTasks::class] as $middleware) {
+        foreach ([EnsureLicenseValid::class, RunScheduledTasks::class, InjectWidget::class] as $middleware) {
             try {
                 method_exists($kernel, 'appendMiddlewareToGroup')
                     ? $kernel->appendMiddlewareToGroup($group, $middleware)

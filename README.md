@@ -88,13 +88,35 @@ Open `/subscription`. Middleware, routes, the scheduler and the UI all register 
 
 | Piece | Details |
 |---|---|
-| Routes | `/subscription`, `/subscription/{license,update,backup}`, `/license/*` JSON endpoints, `/terms`, `/clear-cache`. Everything except `status` and `health-report` requires `auth`. |
-| Middleware | `EnsureLicenseValid` (redirects when the license is unusable) and `RunScheduledTasks` (a web-triggered cron for hosts without one). Both are appended to the `web` group and are also available as the `subandl.license` and `subandl.scheduler` aliases. |
-| Scheduler | `subandl:license-check` every 30 minutes, `subandl:update-check` hourly, `subandl:backup` every 15 minutes. Each one self-throttles. |
+| Routes | `/subscription`, `/subscription/{license,update,backup}`, `/license/*` JSON endpoints, `/subandl/widget` + `/subandl/assets/*` (widget), `/terms`, `/clear-cache`. Everything except `status` and `health-report` requires `auth`. |
+| Middleware | `EnsureLicenseValid` (redirects when the license is unusable), `RunScheduledTasks` (a web-triggered cron for hosts without one) and `InjectWidget` (adds the [global widget](#global-widget) to every HTML page). All three are appended to the `web` group and are also available as the `subandl.license`, `subandl.scheduler` and `subandl.widget` aliases. |
+| Scheduler | `subandl:license-check` every 30 minutes, `subandl:update-check` hourly (announces a new version; installs it only with `update_auto_apply`), `subandl:backup` every 15 minutes. Each one self-throttles. |
 | Commands | `subandl:install`, `subandl:status`, `subandl:license-check [--force]`, `subandl:update-check [--force]`, `subandl:backup [--force]` |
 | Events | `SUBandL\Events\LicenseVerified`, `UpdateFinished`, `BackupFinished` |
 
 Add the system cron (`* * * * * php artisan schedule:run`) when you can. Without it, the web scheduler still triggers the checks from logged-in traffic.
+
+---
+
+## Global widget
+
+`InjectWidget` adds a small edge tab to every page for signed-in users. You don't need to change any layout. It works the same in Blade, Vue and React apps, and it follows Inertia page visits. The tab opens an offcanvas panel with:
+
+- **Payment reminder.** Shown only while `due_amount > 0`, with no countdown. The panel opens on its own, and "Remind me later" (or closing it) hides it for `widget.reminder_minutes`.
+- **Software version.** The installed version, update status and a "Check for update" button.
+- **Cloud backup.** The last successful backup, whether a daily backup is overdue, and a "Backup now" button.
+
+When the provider reports a newer version, a **modal** offers "Update now", which runs the same step-by-step updater as the subscription page. "Later" snoozes that version for `widget.update_snooze_hours`. If the provider sets `force_update`, the modal has no "Later" button.
+
+The update and backup sections follow the `update` and `backup` access abilities. Everything is configured under `widget` in `config/subandl.php`: `enabled`, `hidden_on`, `reminder_minutes`, `update_snooze_hours` and `payment_greeting`. To open the panel from your own UI, add `data-subandl-open` to any element or call `window.SUBandLWidget.open()`.
+
+### Daily backup guarantee
+
+With `backup_daily_minimum` on (the default), a backup runs whenever there has been no **successful** backup in the last 24 hours, even when the customer's automatic backup toggle is off. After a failure it retries every `backup_daily_retry_minutes`. It needs a usable license, and it runs from the scheduler, the web scheduler and the widget, so it works without a system cron.
+
+### Updates: notify, then apply
+
+With `update_auto_apply` set to `false` (the default), `subandl:update-check` only records the newest version and the widget's modal asks the customer to apply it. Set it to `true` to install new versions unattended, which is how v1.1 behaved.
 
 ---
 

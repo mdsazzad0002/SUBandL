@@ -7,12 +7,13 @@ use Illuminate\Support\Facades\Log;
 use SUBandL\License\ServerHealth;
 use SUBandL\Models\LicenseState;
 use SUBandL\SUBandL;
+use SUBandL\Support\UpdateNotice;
 
 class UpdateCheckCommand extends Command
 {
     protected $signature = 'subandl:update-check {--force : Ignore the check interval}';
 
-    protected $description = 'Check for, and apply, the next software update when the license allows it.';
+    protected $description = 'Check for a newer version (and apply it when update_auto_apply is on).';
 
     public function handle(SUBandL $subandl, ServerHealth $health): int
     {
@@ -47,6 +48,23 @@ class UpdateCheckCommand extends Command
 
         $state->last_update_check_at = now();
         $state->save();
+
+        $check = $subandl->checkUpdate();
+        UpdateNotice::record($check);
+
+        // By default a new version is only announced (the widget's update modal);
+        // the customer applies it. auto_apply installs it from here unattended.
+        if (! config('subandl.update_auto_apply', false)) {
+            if (! ($check['ok'] ?? false)) {
+                $this->warn('Update check failed: ' . ($check['message'] ?? 'unknown error'));
+            } elseif ($check['update_available'] ?? false) {
+                $this->info('Update available: v' . ($check['latest_version'] ?? '?') . ' (waiting for the customer to apply it).');
+            } else {
+                $this->info('No update available.');
+            }
+
+            return self::SUCCESS;
+        }
 
         $result = $subandl->update();
 

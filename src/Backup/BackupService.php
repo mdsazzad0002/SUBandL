@@ -3,6 +3,7 @@
 namespace SUBandL\Backup;
 
 use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Process;
 use SUBandL\Events\BackupFinished;
@@ -13,9 +14,11 @@ use SUBandL\Models\LicenseState;
 
 /**
  * Uploads a database backup to the provider using its chunked
- * initialize/chunk/complete flow. Only runs on schedule when the customer has
- * opted in via the subscription page toggle (LicenseState::backup_enabled);
- * a forced run ("Backup Now") ignores the toggle and the schedule.
+ * initialize/chunk/complete flow. Runs every backup_interval_hours when the
+ * customer has opted in via the subscription page toggle
+ * (LicenseState::backup_enabled), and — regardless of that toggle — whenever
+ * there has been no successful backup for 24 hours (backup_daily_minimum).
+ * A forced run ("Backup Now") ignores the toggle and the schedule.
  *
  * Supports mysql/mariadb (mysqldump), pgsql (pg_dump) and sqlite (file copy).
  */
@@ -91,17 +94,67 @@ class BackupService
         }
     }
 
-    public function nextDueAt(?LicenseState $state = null): \Illuminate\Support\Carbon
+    public function nextDueAt(?LicenseState $state = null): Carbon
     {
         $state ??= LicenseState::current();
 
-        if (! $state->last_backup_at) {
-            return now();
+        $due = $this->scheduledDueAt($state);
+
+        if ($this->dailyMinimumApplies($state) && (! $state->backup_enabled || $this->dailyDueAt($state)->lt($due))) {
+            $due = $this->dailyDueAt($state);
         }
 
-        $due = $state->last_backup_at->copy()->addHours((int) config('subandl.backup_interval_hours', 6));
-
         return $due->isPast() ? now() : $due;
+    }
+
+    /**
+     * The customer's automatic backups: due backup_interval_hours after the
+     * previous attempt, success or failure alike, so the daily total stays
+     * predictable even when a run keeps failing.
+     */
+    private function scheduledDueAt(LicenseState $state): Carbon
+    {
+        return $state->last_backup_at
+            ? $state->last_backup_at->copy()->addHours((int) config('subandl.backup_interval_hours', 6))
+            : now();
+    }
+
+    /**
+     * The daily guarantee: at least one SUCCESSFUL backup every 24 hours, even
+     * with the customer's automatic backup switched off. Once overdue, a failed
+     * attempt is retried every backup_daily_retry_minutes rather than every
+     * scheduler tick.
+     */
+    private function dailyDueAt(LicenseState $state): Carbon
+    {
+        $lastSuccess = $this->lastSuccessfulAt();
+        $due = $lastSuccess ? $lastSuccess->copy()->addDay() : now();
+
+        if ($state->last_backup_at) {
+            $retryAt = $state->last_backup_at->copy()->addMinutes((int) config('subandl.backup_daily_retry_minutes', 60));
+            $due = $due->max($retryAt);
+        }
+
+        return $due;
+    }
+
+    /** Only for a working license — an unlicensed install can't upload anyway. */
+    private function dailyMinimumApplies(LicenseState $state): bool
+    {
+        return (bool) config('subandl.backup_daily_minimum', true) && $state->isUsable();
+    }
+
+    public function lastSuccessfulAt(): ?Carbon
+    {
+        return BackupHistory::query()->where('ok', true)->latest('id')->first(['created_at'])?->created_at;
+    }
+
+    /** No successful backup within the last 24 hours. */
+    public function isDailyBackupOverdue(): bool
+    {
+        $lastSuccess = $this->lastSuccessfulAt();
+
+        return ! $lastSuccess || $lastSuccess->lt(now()->subDay());
     }
 
     public function runBackup(bool $force = false): array
@@ -112,14 +165,17 @@ class BackupService
             return ['ok' => false, 'running' => true, 'message' => 'A backup is already running.'];
         }
 
-        if (! $force && ! $state->backup_enabled) {
-            return ['ok' => true, 'skipped' => true, 'message' => 'Backup disabled by customer.'];
-        }
+        if (! $force) {
+            $scheduledDue = $state->backup_enabled && now()->gte($this->scheduledDueAt($state));
+            $dailyDue = $this->dailyMinimumApplies($state) && now()->gte($this->dailyDueAt($state));
 
-        // Due 6h (configurable) after the previous attempt, success or failure alike,
-        // so the daily total stays predictable even when a run keeps failing.
-        if (! $force && $state->last_backup_at && now()->lt($nextDueAt = $this->nextDueAt($state))) {
-            return ['ok' => true, 'skipped' => true, 'message' => "Not due yet. Next backup at {$nextDueAt->toDateTimeString()}."];
+            if (! $scheduledDue && ! $dailyDue) {
+                if (! $state->backup_enabled && ! $this->dailyMinimumApplies($state)) {
+                    return ['ok' => true, 'skipped' => true, 'message' => 'Backup disabled by customer.'];
+                }
+
+                return ['ok' => true, 'skipped' => true, 'message' => "Not due yet. Next backup at {$this->nextDueAt($state)->toDateTimeString()}."];
+            }
         }
 
         // No point dumping the whole database just to fail the upload.

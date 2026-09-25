@@ -20,6 +20,12 @@ class EnsureLicenseValid
             return $next($request);
         }
 
+        // The widget's static files; a published config's allowed_when_invalid
+        // predates them, so they are exempted here rather than in the config.
+        if ($request->routeIs('subandl.asset')) {
+            return $next($request);
+        }
+
         foreach ((array) config('subandl.allowed_when_invalid', []) as $allowed) {
             if ($request->is($allowed)) {
                 return $next($request);

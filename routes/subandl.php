@@ -2,6 +2,12 @@
 
 use Illuminate\Support\Facades\Route;
 use SUBandL\Http\Controllers\SubscriptionController as C;
+use SUBandL\Http\Controllers\WidgetController as W;
+
+// The global widget's own JS/CSS (see InjectWidget).
+Route::get('/subandl/assets/{file}', [W::class, 'asset'])
+    ->where('file', '[a-z]+\.(js|css)')
+    ->name('subandl.asset');
 
 Route::get('/license/verification-required', [C::class, 'verificationRequired'])->name('license.verification-required');
 Route::get('/terms', [C::class, 'terms'])->name('license.terms');
@@ -17,6 +23,8 @@ Route::get('/license/status', [C::class, 'status'])->name('license.status');
 Route::post('/license/health-report', [C::class, 'reportHealth'])->name('license.health-report');
 
 Route::middleware('auth')->group(function () {
+    Route::get('/subandl/widget', [W::class, 'state'])->name('subandl.widget');
+
     Route::post('/license/save', [C::class, 'saveLicense'])->name('license.save');
     Route::post('/license/check', [C::class, 'checkLicense'])->name('license.check');
 

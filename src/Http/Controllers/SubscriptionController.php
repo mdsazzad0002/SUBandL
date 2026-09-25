@@ -18,6 +18,7 @@ use SUBandL\Models\UpdateHistory;
 use SUBandL\SUBandL;
 use SUBandL\Support\Access;
 use SUBandL\Support\BackgroundArtisan;
+use SUBandL\Support\UpdateNotice;
 use SUBandL\Update\UpdateApplier;
 
 class SubscriptionController extends Controller
@@ -241,11 +242,21 @@ class SubscriptionController extends Controller
 
             $hours = (int) config('subandl.update_check_hours', 2);
             if ($state->last_update_check_at && $state->last_update_check_at->gt(now()->subHours($hours))) {
-                return response()->json(['ok' => true, 'skipped' => true, 'update_available' => false]);
+                // Not due for a live check — answer from the last one instead of
+                // reporting "no update" and hiding a pending version.
+                $notice = UpdateNotice::get();
+
+                return response()->json([
+                    'ok' => true,
+                    'skipped' => true,
+                    'update_available' => $notice['available'],
+                    'latest_version' => $notice['latest_version'],
+                ]);
             }
         }
 
         $result = $client->checkForUpdate(config('subandl.version', '1.0.0'));
+        UpdateNotice::record($result);
 
         $state->last_update_check_at = now();
         $state->save();

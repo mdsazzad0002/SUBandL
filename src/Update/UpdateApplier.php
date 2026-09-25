@@ -9,6 +9,7 @@ use SUBandL\Events\UpdateFinished;
 use SUBandL\Models\LicenseState;
 use SUBandL\Models\UpdateHistory;
 use SUBandL\Support\CliPhpBinary;
+use SUBandL\Support\UpdateNotice;
 use Symfony\Component\Process\Process;
 use ZipArchive;
 
@@ -90,6 +91,10 @@ class UpdateApplier
             'to_version' => $toVersion,
             'message' => $ok ? "Applied update to v{$toVersion}." : ($result['message'] ?? 'Update failed.'),
         ]);
+
+        if ($ok) {
+            UpdateNotice::clear();
+        }
 
         event(new UpdateFinished($ok, $fromVersion, $toVersion, $result));
 
