@@ -131,8 +131,15 @@ return [
     |--------------------------------------------------------------------------
     | User interface
     |--------------------------------------------------------------------------
-    | `blade`   — the package's own self-contained pages (works everywhere).
-    | `inertia` — render your own Inertia components listed in `pages`.
+    | `blade`   — the package's own standalone pages; no build step (default).
+    | `vue`     — bundled Vue 3 Inertia pages (SUBandL/*), published with
+    |             `php artisan subandl:install --ui=vue`.
+    | `react`   — bundled React Inertia pages (SUBandL/*), published with
+    |             `php artisan subandl:install --ui=react`.
+    | `inertia` — your own Inertia components, named in `pages` below.
+    |
+    | All three bundled UIs share resources/js/subandl/{subandl.js,subandl.css}
+    | for API calls, the update/backup flows and styling.
     */
     'ui' => [
         'driver' => 'blade',

@@ -49,6 +49,16 @@ class SUBandLServiceProvider extends ServiceProvider
                 __DIR__ . '/../resources/views' => resource_path('views/vendor/subandl'),
             ], 'subandl-views');
 
+            // Vue / React pages share one core (resources/js/subandl) with the Blade UI.
+            // Pages import it as ../../subandl/, so both keep that relative layout.
+            foreach (['vue' => 'vue', 'react' => 'jsx'] as $ui => $extension) {
+                $files = [__DIR__ . '/../resources/js/subandl' => resource_path('js/subandl')];
+                foreach (glob(__DIR__ . "/../resources/js/Pages/SUBandL/*.{$extension}") ?: [] as $page) {
+                    $files[$page] = resource_path('js/Pages/SUBandL/' . basename($page));
+                }
+                $this->publishes($files, "subandl-{$ui}");
+            }
+
             $this->registerSchedule();
         }
     }

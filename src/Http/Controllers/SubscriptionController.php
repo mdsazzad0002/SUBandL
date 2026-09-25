@@ -51,12 +51,11 @@ class SubscriptionController extends Controller
             return $this->forbidden();
         }
 
-        return $this->render('license', 'subandl::subscription', [
-            'currentVersion' => config('subandl.version', '1.0.0'),
-            'tab' => 'license',
-            'canUpdate' => Access::allows('update'),
-            'canBackup' => Access::allows('backup'),
-        ]);
+        return $this->render('license', 'subandl::subscription', $this->subscriptionProps(
+            'license',
+            Access::allows('update'),
+            Access::allows('backup'),
+        ));
     }
 
     public function subscriptionUpdate()
@@ -68,12 +67,11 @@ class SubscriptionController extends Controller
             return $this->forbidden();
         }
 
-        return $this->render('update', 'subandl::subscription', [
-            'currentVersion' => config('subandl.version', '1.0.0'),
-            'tab' => $canUpdate ? 'update' : 'backup',
-            'canUpdate' => $canUpdate,
-            'canBackup' => $canBackup,
-        ]);
+        return $this->render('update', 'subandl::subscription', $this->subscriptionProps(
+            $canUpdate ? 'update' : 'backup',
+            $canUpdate,
+            $canBackup,
+        ));
     }
 
     public function subscriptionBackup()
@@ -427,21 +425,74 @@ class SubscriptionController extends Controller
         return $due->isPast() ? now() : $due;
     }
 
+    /**
+     * The props every subscription page gets — identical for the Blade, Vue and
+     * React UIs (and any custom Inertia page).
+     */
+    private function subscriptionProps(string $tab, bool $canUpdate, bool $canBackup): array
+    {
+        $state = LicenseState::current();
+
+        return [
+            'currentVersion' => config('subandl.version', '1.0.0'),
+            'tab' => $tab,
+            'canUpdate' => $canUpdate,
+            'canBackup' => $canBackup,
+            'licenseKey' => $state->license_key,
+            'backupEnabled' => (bool) $state->backup_enabled,
+            'backupIntervalHours' => (int) config('subandl.backup_interval_hours', 6),
+            'providerUrl' => config('subandl.provider_url'),
+        ];
+    }
+
+    /**
+     * blade   — the package's standalone Blade pages
+     * vue     — Inertia pages SUBandL/* published with --tag=subandl-vue
+     * react   — Inertia pages SUBandL/* published with --tag=subandl-react
+     * inertia — your own Inertia pages, named in ui.pages
+     */
+    private function driver(): string
+    {
+        $driver = (string) config('subandl.ui.driver', 'blade');
+
+        if ($driver !== 'blade' && ! class_exists(\Inertia\Inertia::class)) {
+            return 'blade';
+        }
+
+        return $driver;
+    }
+
     private function forbidden()
     {
-        if (config('subandl.ui.driver') === 'inertia' && class_exists(\Inertia\Inertia::class)) {
+        if ($this->driver() === 'inertia') {
             return \Inertia\Inertia::render(config('subandl.ui.pages.forbidden', 'Error/Forbidden'));
         }
 
         abort(403);
     }
 
+    private const BUNDLED_PAGES = [
+        'verification_required' => 'SUBandL/VerificationRequired',
+        'terms' => 'SUBandL/Terms',
+        'license' => 'SUBandL/Subscription',
+        'update' => 'SUBandL/Subscription',
+    ];
+
     private function render(string $page, string $view, array $props = [])
     {
-        if (config('subandl.ui.driver') === 'inertia' && class_exists(\Inertia\Inertia::class)) {
-            return \Inertia\Inertia::render(config("subandl.ui.pages.{$page}"), $props);
-        }
+        $props += [
+            'base' => rtrim(url((string) config('subandl.routes.prefix', '')), '/'),
+            'urls' => [
+                'license' => route('subscription.license'),
+                'update' => route('subscription.update'),
+                'terms' => route('license.terms'),
+            ],
+        ];
 
-        return view($view, $props + ['state' => LicenseState::current()]);
+        return match ($this->driver()) {
+            'inertia' => \Inertia\Inertia::render(config("subandl.ui.pages.{$page}"), $props),
+            'vue', 'react' => \Inertia\Inertia::render(self::BUNDLED_PAGES[$page], $props),
+            default => view($view, $props),
+        };
     }
 }

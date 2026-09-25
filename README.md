@@ -61,7 +61,8 @@ The package also works from a private Git repository (`"type": "vcs"`) or from a
 ### 2. Configure and migrate
 
 ```bash
-php artisan subandl:install      # publishes config/subandl.php and runs the migration
+php artisan subandl:install              # publishes config/subandl.php, runs the migration (Blade UI)
+php artisan subandl:install --ui=vue     # or --ui=react
 ```
 
 Add to `.env`:
@@ -125,7 +126,7 @@ Route::middleware(['web', 'auth', 'subandl.license'])->group(...);
 
 Everything lives in `config/subandl.php`:
 
-- **UI**: `ui.driver = blade` uses the built-in standalone pages, which work in any project. `inertia` renders your own components listed in `ui.pages`. To restyle the Blade pages, run `vendor:publish --tag=subandl-views`.
+- **UI**: see [User interface](#user-interface-blade-vue-react) below.
 - **Permissions**: set `access.resolver` to any class implementing `SUBandL\Contracts\AccessResolver`. The default allows any logged-in user. If you define a Gate named after an ability (`license`, `licenseUpdate`, `licenseBackup`), that Gate decides instead.
 - **Tables**: `tables.*` lets you rename the tables.
 - **Updates**: `update.protected_paths`, `update.blocked_commands`, `update.after_update_commands` and `update.remove_manifest`.
@@ -134,6 +135,33 @@ Everything lives in `config/subandl.php`:
 > `.env` is never shipped in a release zip. `config/subandl.php` is shipped. Put anything that must reach existing customers in the config file.
 
 ---
+
+## User interface: Blade, Vue, React
+
+The package ships three UIs. All of them use one shared core:
+
+```
+resources/js/subandl/subandl.js    API calls, update/backup step flows, formatting, terms text
+resources/js/subandl/subandl.css   styles, all scoped under .subandl
+resources/views/*.blade.php        Blade UI: inlines the core, needs no build step
+resources/js/Pages/SUBandL/*.vue   Vue 3 Inertia pages   ┐ presentation only;
+resources/js/Pages/SUBandL/*.jsx   React Inertia pages   ┘ they import ../../subandl/
+```
+
+Fix a behaviour once in `subandl.js`, or a style once in `subandl.css`, and all three UIs pick it up. The page files only render.
+
+| Driver | Setup | Requires |
+|---|---|---|
+| `blade` (default) | Nothing to do. | Nothing |
+| `vue` | `php artisan subandl:install --ui=vue`, then `npm run build` | Inertia + Vue 3 |
+| `react` | `php artisan subandl:install --ui=react`, then `npm run build` | Inertia + React |
+| `inertia` | Set your own page names in `ui.pages`. | Inertia |
+
+`--ui=vue` or `--ui=react` publishes the pages to `resources/js/Pages/SUBandL/` and the core to `resources/js/subandl/`, then sets `ui.driver`. Inertia resolves the pages as `SUBandL/Subscription`, `SUBandL/VerificationRequired` and `SUBandL/Terms`. After publishing, you can wrap them in your app layout, for example with `defineOptions({ layout })` in Vue or `Page.layout = …` in React. Re-run the publish with `--force` to pick up package updates. If you do not have Inertia installed, the driver falls back to Blade.
+
+Every page receives the same props: `currentVersion`, `tab`, `canUpdate`, `canBackup`, `licenseKey`, `backupEnabled`, `backupIntervalHours`, `providerUrl`, `base` and `urls {license, update, terms}`. The verification page gets `status` and `message` instead. Custom `inertia` pages receive these props too.
+
+To restyle the Blade pages: `php artisan vendor:publish --tag=subandl-views`.
 
 ## Release package format (for the portal)
 
