@@ -38,7 +38,17 @@ class WidgetController extends Controller
             'urls' => [
                 'subscription' => route('subscription.license'),
                 'update' => route('subscription.update'),
+                'terms' => route('license.terms'),
+                'home' => SubscriptionController::homeUrl(),
             ],
+
+            // Which of the panel's tabs this user may use.
+            'access' => [
+                'license' => Access::allows('license'),
+                'update' => $canUpdate,
+                'backup' => $canBackup,
+            ],
+            'backup_interval_hours' => (int) config('subandl.backup_interval_hours', 6),
 
             // Sends a tab left open to the subscription page once the cached
             // license turns unusable (the middleware only sees navigations).

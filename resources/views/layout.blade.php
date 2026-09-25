@@ -8,7 +8,7 @@
     {{-- Same stylesheet the Vue and React pages import. --}}
     <style>{!! \SUBandL\Support\Assets::inline('subandl.css') !!}</style>
     <style>
-        body { margin: 0; background: #f5f6f8; }
+        body { margin: 0; background: #f5f6f8; font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
         @media (prefers-color-scheme: dark) { body { background: #0f1115; } }
     </style>
 </head>

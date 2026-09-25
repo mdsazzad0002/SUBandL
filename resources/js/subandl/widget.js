@@ -1,15 +1,22 @@
 /**
  * SUBandL global widget — injected into every page by InjectWidget.
  *
- *   • edge tab → offcanvas panel: payment reminder card (only while an amount
- *     is due), version / update status, backup status
+ *   • edge tab → full-screen panel with two tabs:
+ *       Subscription    — payment reminder (only while an amount is due),
+ *                         license status, license key form
+ *       Update & Backup — version / update, backup (toggle, run), history
  *   • modal whenever a newer version is available, to apply it right there
+ *
+ * The /subscription/* pages render only a #subandl-page placeholder; the
+ * widget then shows the same panel in "page mode" (no close button), so the
+ * subscription UI exists exactly once.
  *
  * Framework-agnostic (plain DOM), so it behaves the same inside Blade, Vue or
  * React hosts. Follows Inertia page visits via the `inertia:navigate` event.
- * Host pages can open the panel with `data-subandl-open` or SUBandLWidget.open().
+ * Host pages open the panel with `data-subandl-open` (value: "license" or
+ * "update", optional) or SUBandLWidget.open(tab).
  */
-import { createSubandl } from './subandl.js';
+import { createSubandl, fmt, statusTone, LICENSE_FIELDS } from './subandl.js';
 
 const script = document.getElementById('subandl-widget');
 const cfg = (() => {
@@ -25,11 +32,19 @@ const REFRESH_MS = 5 * 60 * 1000;
 const DUE_SNOOZE_KEY = 'subandl:due-snooze-until';
 const UPDATE_SNOOZE_KEY = 'subandl:update-snooze:';
 
+const pageEl = document.getElementById('subandl-page');
+const pageMode = !!pageEl;
+
 let state = null; // last /subandl/widget payload, null while signed out
 let fetchedAt = 0;
-let busy = null; // 'update' | 'backup' while a flow runs
+let busy = null; // 'update' | 'backup' | 'check' | 'license' while a flow runs
 let panelOpen = false;
+let tab = 'license'; // 'license' | 'update'
+let status = null; // /license/status, loaded when the panel opens
+let history = null; // merged update + backup history, loaded on the update tab
+let licenseDraft = null;
 let modalDismissedFor = null;
+let flash = null; // { tone, text }
 
 /* ------------------------------------------------------------------ utils */
 
@@ -100,29 +115,47 @@ function matchesHere(patterns) {
     });
 }
 
-const isHiddenHere = () => matchesHere(cfg.hiddenOn);
+const isHiddenHere = () => !pageMode && matchesHere(cfg.hiddenOn);
+
+/* ------------------------------------------------------------------- tabs */
+
+const hasLicenseTab = () => !!state && (!!state.access?.license || !!state.payment);
+const hasUpdateTab = () => !!state && (!!state.update || !!state.backup);
+
+function normalizeTab(name) {
+    const wanted = name === 'update' || name === 'backup' ? 'update' : name === 'license' ? 'license' : null;
+    if (wanted === 'license' && hasLicenseTab()) return 'license';
+    if (wanted === 'update' && hasUpdateTab()) return 'update';
+    // No preference: whatever needs attention first.
+    if (state?.payment) return 'license';
+    if (hasUpdateTab() && (state.update?.available || state.backup?.overdue)) return 'update';
+    return hasLicenseTab() ? 'license' : 'update';
+}
 
 /* -------------------------------------------------------------------- DOM */
 
 const icons = {
     shield: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>',
-    close: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>',
+    close: '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>',
 };
 
 const root = document.createElement('div');
-root.className = 'sbw';
+root.className = 'sbw' + (pageMode ? ' sbw-page' : '');
 root.hidden = true;
 root.innerHTML = `
     <button type="button" class="sbw-tab" data-sbw="open" aria-label="Subscription, updates and backup">
         ${icons.shield}<span class="sbw-dot" hidden></span>
     </button>
-    <div class="sbw-backdrop" data-sbw="close"></div>
     <aside class="sbw-panel" role="dialog" aria-modal="true" aria-labelledby="sbw-title" tabindex="-1">
         <header class="sbw-head">
-            <h2 id="sbw-title">Subscription</h2>
-            <button type="button" class="sbw-icon" data-sbw="close" aria-label="Close">${icons.close}</button>
+            <div class="sbw-head-in">
+                <h2 id="sbw-title">Subscription</h2>
+                <nav class="sbw-tabs" role="tablist"></nav>
+                ${pageMode ? '<a class="sbw-btn sbw-ghost sbw-back" href="/">&larr; Back</a>' : ''}
+                <button type="button" class="sbw-icon sbw-close" data-sbw="close" aria-label="Close">${icons.close}</button>
+            </div>
         </header>
-        <div class="sbw-body"></div>
+        <div class="sbw-body"><div class="sbw-body-in"></div></div>
     </aside>
     <div class="sbw-modal" hidden>
         <div class="sbw-modal-card" role="alertdialog" aria-modal="true" aria-labelledby="sbw-modal-title"></div>
@@ -130,7 +163,8 @@ root.innerHTML = `
 
 const $ = (sel) => root.querySelector(sel);
 const panel = $('.sbw-panel');
-const body = $('.sbw-body');
+const tabsNav = $('.sbw-tabs');
+const body = $('.sbw-body-in');
 const modal = $('.sbw-modal');
 const modalCard = $('.sbw-modal-card');
 
@@ -160,26 +194,56 @@ function renderPayment(p) {
             ${p.monthly_fee != null && p.monthly_fee !== '' ? `<p class="sbw-kv"><span>Monthly fee</span><strong>${money(p.monthly_fee)} ${esc(p.currency)}</strong></p>` : ''}
             ${rows.length ? `<div class="sbw-box"><span class="sbw-label">Payment information</span>${rows.map((r) => `<p>${r}</p>`).join('')}</div>` : ''}
             ${info.closing ? `<p class="sbw-muted">${esc(info.closing)}</p>` : ''}
-            <div class="sbw-actions">
+            ${pageMode ? '' : `<div class="sbw-actions">
                 <button type="button" class="sbw-btn sbw-ghost" data-sbw="later">Remind me later</button>
-                <a class="sbw-btn" href="${esc(state.urls.subscription)}">Go to subscription</a>
-            </div>
+            </div>`}
+        </section>`;
+}
+
+function renderLicense() {
+    if (!status) return '<section class="sbw-card"><p class="sbw-muted">Loading…</p></section>';
+
+    const cells = LICENSE_FIELDS.map(([key, label]) => {
+        const value = key === 'status'
+            ? `<span class="sbw-badge sbw-${statusTone(status.status)}">${esc(fmt(status.status))}${status.in_grace_period ? ' (grace)' : ''}</span>`
+            : esc(fmt(status[key]));
+        return `<div><span class="sbw-label">${esc(label)}</span><div class="sbw-value">${value}</div></div>`;
+    }).join('');
+
+    return `
+        <section class="sbw-card">
+            <h3>License</h3>
+            <div class="sbw-grid">${cells}</div>
+            ${status.message ? `<p class="sbw-note sbw-bad">${esc(status.message)}</p>` : ''}
+        </section>
+        <section class="sbw-card">
+            <h3>License key</h3>
+            <form class="sbw-row" data-sbw-form="license">
+                <input class="sbw-input" type="text" name="license" autocomplete="off" spellcheck="false" placeholder="XXXX-XXXX-XXXX-XXXX" value="${esc(licenseDraft ?? '')}" aria-label="License key">
+                <button class="sbw-btn" type="submit" ${busy ? 'disabled' : ''}>${busy === 'license' ? 'Verifying…' : 'Save &amp; verify'}</button>
+                <button class="sbw-btn sbw-ghost" type="button" data-sbw="refresh-license" ${busy ? 'disabled' : ''}>Refresh</button>
+            </form>
+            <p class="sbw-muted">By using this software you agree to the <a href="${esc(state.urls.terms)}">terms</a>.</p>
         </section>`;
 }
 
 function renderUpdate(u) {
-    let status;
-    if (u.running || busy === 'update') status = '<span class="sbw-badge sbw-info">Updating…</span>';
-    else if (u.available) status = `<span class="sbw-badge sbw-new">v${esc(u.latest_version)} available</span>`;
-    else status = '<span class="sbw-badge sbw-ok">Up to date</span>';
+    let badge;
+    if (u.running || busy === 'update') badge = '<span class="sbw-badge sbw-info">Updating…</span>';
+    else if (u.available) badge = `<span class="sbw-badge sbw-new">v${esc(u.latest_version)} available</span>`;
+    else badge = '<span class="sbw-badge sbw-ok">Up to date</span>';
+
+    const lastResult = status?.last_update_message
+        ? `<p class="sbw-muted">Last update: ${esc(status.last_update_message)}</p>` : '';
 
     return `
         <section class="sbw-card">
             <h3>Software version</h3>
             <p class="sbw-kv"><span>Installed</span><strong>v${esc(state.version)}</strong></p>
-            <p class="sbw-kv"><span>Status</span>${status}</p>
+            <p class="sbw-kv"><span>Status</span>${badge}</p>
             ${u.support_expired ? '<p class="sbw-note sbw-bad">Update support has expired — renew it to receive updates.</p>' : ''}
             <p class="sbw-muted">Last checked: ${u.checked_at ? ago(u.checked_at) : 'not yet'}</p>
+            ${lastResult}
             <div class="sbw-actions">
                 ${u.available && !u.running
                     ? `<button type="button" class="sbw-btn" data-sbw="update-modal" ${busy ? 'disabled' : ''}>Update to v${esc(u.latest_version)}</button>`
@@ -189,34 +253,87 @@ function renderUpdate(u) {
 }
 
 function renderBackup(b) {
-    let status;
-    if (b.running || busy === 'backup') status = '<span class="sbw-badge sbw-info">Backing up…</span>';
-    else if (b.overdue) status = '<span class="sbw-badge sbw-bad">No backup in 24 h</span>';
-    else status = '<span class="sbw-badge sbw-ok">Protected</span>';
+    let badge;
+    if (b.running || busy === 'backup') badge = '<span class="sbw-badge sbw-info">Backing up…</span>';
+    else if (b.overdue) badge = '<span class="sbw-badge sbw-bad">No backup in 24 h</span>';
+    else badge = '<span class="sbw-badge sbw-ok">Protected</span>';
 
     return `
         <section class="sbw-card">
             <h3>Cloud backup</h3>
-            <p class="sbw-kv"><span>Status</span>${status}</p>
+            <p class="sbw-kv"><span>Status</span>${badge}</p>
             <p class="sbw-kv"><span>Last successful</span><strong>${b.last_success_at ? `${date(b.last_success_at, true)} <small>(${ago(b.last_success_at)})</small>` : 'never'}</strong></p>
             ${b.last_status === 'failed' && b.last_message ? `<p class="sbw-note sbw-bad">Last attempt failed: ${esc(b.last_message)}</p>` : ''}
-            <p class="sbw-muted">${b.enabled ? 'Automatic backup is on.' : 'Automatic backup is off — a daily backup still runs.'} Next: ${date(b.next_at, true)}</p>
+            <label class="sbw-check">
+                <input type="checkbox" data-sbw-toggle="backup" ${b.enabled ? 'checked' : ''} ${busy ? 'disabled' : ''}>
+                <span>Automatic cloud backup (every ${esc(state.backup_interval_hours || 6)} hours)</span>
+            </label>
+            <p class="sbw-muted">${b.enabled ? '' : 'A daily backup still runs while this is off. '}Next: ${date(b.next_at, true)}</p>
             <div class="sbw-actions">
                 <button type="button" class="sbw-btn sbw-ghost" data-sbw="backup" ${busy ? 'disabled' : ''}>Backup now</button>
             </div>
         </section>`;
 }
 
-let flash = null; // { tone, text }
+function renderHistory() {
+    let rows;
+    if (history === null) rows = '<tr><td colspan="4" class="sbw-muted">Loading…</td></tr>';
+    else if (!history.length) rows = '<tr><td colspan="4" class="sbw-muted">No history yet.</td></tr>';
+    else rows = history.map((h) => `
+        <tr>
+            <td>${date(h.at, true)}</td>
+            <td>${esc(h.type)}</td>
+            <td><span class="sbw-badge sbw-${h.ok ? 'ok' : 'bad'}">${h.ok ? 'Success' : 'Failed'}</span></td>
+            <td>${esc(fmt(h.message))}</td>
+        </tr>`).join('');
+
+    return `
+        <section class="sbw-card sbw-wide">
+            <h3>History</h3>
+            <div class="sbw-table-wrap">
+                <table class="sbw-table">
+                    <thead><tr><th>When</th><th>Type</th><th>Result</th><th>Details</th></tr></thead>
+                    <tbody>${rows}</tbody>
+                </table>
+            </div>
+        </section>`;
+}
+
+function renderTabs() {
+    const tabs = [
+        hasLicenseTab() && ['license', 'License'],
+        hasUpdateTab() && ['update', 'Update & Backup'],
+    ].filter(Boolean);
+
+    tabsNav.hidden = tabs.length < 2;
+    tabsNav.innerHTML = tabs.map(([key, label]) => `
+        <button type="button" role="tab" class="sbw-tabbtn${tab === key ? ' sbw-active' : ''}" aria-selected="${tab === key}" data-sbw-tab="${key}">
+            ${esc(label)}${key === 'update' && (state.update?.available || state.backup?.overdue) ? '<span class="sbw-pip"></span>' : ''}
+        </button>`).join('');
+}
 
 function render() {
     if (!state) return;
-    body.innerHTML = [
-        flash ? `<p class="sbw-flash sbw-${flash.tone}" role="status">${esc(flash.text)}</p>` : '',
-        state.payment ? renderPayment(state.payment) : '',
-        state.update ? renderUpdate(state.update) : '',
-        state.backup ? renderBackup(state.backup) : '',
-    ].join('');
+
+    const flashHtml = flash ? `<p class="sbw-flash sbw-wide sbw-${flash.tone}" role="status">${esc(flash.text)}</p>` : '';
+    let content;
+
+    if (tab === 'license') {
+        content = [
+            state.payment ? renderPayment(state.payment) : '',
+            state.access?.license ? renderLicense() : '',
+        ].join('');
+    } else {
+        content = [
+            state.update ? renderUpdate(state.update) : '',
+            state.backup ? renderBackup(state.backup) : '',
+            renderHistory(),
+        ].join('');
+    }
+
+    renderTabs();
+    if (pageMode && state.urls.home) $('.sbw-back').href = state.urls.home;
+    body.innerHTML = flashHtml + content;
 
     const attention = !!state.payment || !!state.update?.available || !!state.backup?.overdue;
     $('.sbw-dot').hidden = !attention;
@@ -243,18 +360,52 @@ function renderModal(u, progress = null, error = null) {
 
 /* ------------------------------------------------------------- behaviour */
 
-function openPanel() {
+// The panel's detail data (license status, history) is only fetched while it
+// is open — from this app, never from the provider.
+async function loadDetails() {
+    const needsHistory = tab === 'update';
+    const [s, h] = await Promise.all([api.status(), needsHistory ? api.history() : null]);
+    if (s.ok) {
+        status = s.data;
+        if (licenseDraft === null) licenseDraft = status.license_key || '';
+    }
+    if (needsHistory) history = h;
+    render();
+}
+
+function lockScroll(lock) {
+    document.documentElement.classList.toggle('sbw-noscroll', lock);
+}
+
+function openPanel(name) {
     if (!state) return;
+    tab = normalizeTab(name);
     panelOpen = true;
+    render();
     root.classList.add('sbw-open');
+    lockScroll(true);
     panel.focus({ preventScroll: true });
+    loadDetails();
 }
 
 function closePanel() {
+    if (pageMode) return;
     panelOpen = false;
+    flash = null;
     root.classList.remove('sbw-open');
+    lockScroll(false);
     // Closing while a payment is due counts as "remind me later".
     if (state?.payment) snooze(DUE_SNOOZE_KEY, (cfg.reminderMinutes || 10) * 60000);
+}
+
+function switchTab(name) {
+    const next = normalizeTab(name);
+    if (next === tab) return;
+    tab = next;
+    flash = null;
+    if (tab === 'update') history = null;
+    render();
+    loadDetails();
 }
 
 function showModal() {
@@ -271,8 +422,7 @@ function autoPrompt() {
     if (!state || root.hidden || busy) return;
 
     if (state.payment && !panelOpen && !snoozed(DUE_SNOOZE_KEY)) {
-        render();
-        openPanel();
+        openPanel('license');
     }
 
     const u = state.update;
@@ -299,7 +449,11 @@ async function refresh(force = false) {
     if (state.health_check_url) api.reportHealth(state.health_check_url);
     if (redirectIfLicenseUnusable()) return;
     applyVisibility();
-    render();
+
+    // Don't wipe what the user is typing into the license form.
+    if (!(root.contains(document.activeElement) && document.activeElement.tagName === 'INPUT')) {
+        render();
+    }
     autoPrompt();
 }
 
@@ -313,11 +467,12 @@ function redirectIfLicenseUnusable() {
 }
 
 function applyVisibility() {
-    const hasContent = !!state && (state.payment || state.update || state.backup);
+    const hasContent = hasLicenseTab() || hasUpdateTab();
     root.hidden = !hasContent || isHiddenHere();
     if (root.hidden) {
         root.classList.remove('sbw-open');
         panelOpen = false;
+        lockScroll(false);
         hideModal();
     }
 }
@@ -351,6 +506,16 @@ async function runBackup() {
     busy = null;
     flash = { tone: result.ok ? 'ok' : 'bad', text: result.message };
     await refresh(true);
+    if (panelOpen) loadDetails();
+}
+
+async function toggleBackup(enabled) {
+    if (busy) return;
+    const r = await api.toggleBackup(enabled);
+    flash = r.ok
+        ? { tone: 'ok', text: `Automatic backup ${r.enabled ? 'enabled' : 'disabled'}.` }
+        : { tone: 'bad', text: 'Could not change the setting.' };
+    await refresh(true);
     render();
 }
 
@@ -372,14 +537,50 @@ async function checkUpdate() {
     render();
 }
 
+async function saveLicense(value) {
+    if (busy) return;
+    busy = 'license';
+    flash = { tone: 'info', text: 'Verifying the license…' };
+    render();
+
+    const r = await api.saveLicense(value);
+    busy = null;
+    flash = { tone: r.ok ? 'ok' : 'bad', text: r.message };
+    await refresh(true);
+    await loadDetails();
+}
+
+async function refreshLicense() {
+    if (busy) return;
+    busy = 'license';
+    flash = { tone: 'info', text: 'Checking the license…' };
+    render();
+
+    const r = await api.refreshLicense();
+    busy = null;
+    if (r.ok) {
+        status = r.data;
+        flash = { tone: 'ok', text: 'License refreshed.' };
+    } else {
+        flash = { tone: 'bad', text: r.data?.message || 'Could not refresh the license.' };
+    }
+    await refresh(true);
+    render();
+}
+
 root.addEventListener('click', (event) => {
+    const tabBtn = event.target.closest('[data-sbw-tab]');
+    if (tabBtn) {
+        switchTab(tabBtn.dataset.sbwTab);
+        return;
+    }
+
     const action = event.target.closest('[data-sbw]')?.dataset.sbw;
     if (!action) return;
 
     switch (action) {
         case 'open':
             flash = null;
-            render();
             openPanel();
             break;
         case 'close':
@@ -404,7 +605,26 @@ root.addEventListener('click', (event) => {
         case 'backup':
             runBackup();
             break;
+        case 'refresh-license':
+            refreshLicense();
+            break;
     }
+});
+
+root.addEventListener('submit', (event) => {
+    const form = event.target.closest('[data-sbw-form="license"]');
+    if (!form) return;
+    event.preventDefault();
+    const value = form.elements.license.value.trim();
+    if (value) saveLicense(value);
+});
+
+root.addEventListener('input', (event) => {
+    if (event.target.name === 'license') licenseDraft = event.target.value;
+});
+
+root.addEventListener('change', (event) => {
+    if (event.target.dataset?.sbwToggle === 'backup') toggleBackup(event.target.checked);
 });
 
 document.addEventListener('keydown', (event) => {
@@ -417,22 +637,29 @@ document.addEventListener('keydown', (event) => {
     }
 });
 
-// Host hooks: <button data-subandl-open> anywhere, or SUBandLWidget.open().
+// Host hooks: <a href="/subscription/license" data-subandl-open="license"> anywhere
+// (the link still works if the widget is not loaded), or SUBandLWidget.open(tab).
 document.addEventListener('click', (event) => {
-    if (event.target.closest?.('[data-subandl-open]')) {
-        event.preventDefault();
-        refresh(true).then(openPanel);
-    }
+    const trigger = event.target.closest?.('[data-subandl-open]');
+    if (!trigger || !state || pageMode) return;
+    event.preventDefault();
+    flash = null;
+    openPanel(trigger.dataset.subandlOpen || undefined);
+    refresh(true);
 });
 
-window.SUBandLWidget = { open: () => refresh(true).then(openPanel), close: closePanel, refresh: () => refresh(true) };
+window.SUBandLWidget = {
+    open: (name) => refresh(true).then(() => openPanel(name)),
+    close: closePanel,
+    refresh: () => refresh(true),
+};
 
 function onNavigate() {
     applyVisibility();
     refresh();
 }
 
-function start() {
+async function start() {
     document.body.appendChild(root);
     document.addEventListener('inertia:navigate', onNavigate);
     window.addEventListener('popstate', onNavigate);
@@ -441,7 +668,10 @@ function start() {
     setInterval(autoPrompt, 60000);
 
     // Guests: stay idle until an Inertia login navigates to a signed-in page.
-    if (cfg.auth) refresh(true);
+    if (!cfg.auth) return;
+
+    await refresh(true);
+    if (pageMode && state) openPanel(pageEl.dataset.tab);
 }
 
 if (document.readyState === 'loading') {

@@ -30,7 +30,7 @@ class SubscriptionController extends Controller
         $state = LicenseState::current();
 
         if ($state->isUsable()) {
-            return redirect($this->homeUrl());
+            return redirect(self::homeUrl());
         }
 
         return $this->render('verification_required', 'subandl::verification-required', [
@@ -467,6 +467,8 @@ class SubscriptionController extends Controller
             'licenseKey' => $state->license_key,
             'backupEnabled' => (bool) $state->backup_enabled,
             'backupIntervalHours' => (int) config('subandl.backup_interval_hours', 6),
+            // Blade only: let the global widget render the page as its panel.
+            'widgetPage' => (bool) config('subandl.widget.enabled', true),
         ];
     }
 
@@ -514,7 +516,7 @@ class SubscriptionController extends Controller
         abort(403);
     }
 
-    private function homeUrl(): string
+    public static function homeUrl(): string
     {
         $home = config('subandl.home_route');
 
@@ -536,7 +538,7 @@ class SubscriptionController extends Controller
                 'license' => route('subscription.license'),
                 'update' => route('subscription.update'),
                 'terms' => route('license.terms'),
-                'home' => $this->homeUrl(),
+                'home' => self::homeUrl(),
             ],
         ];
 

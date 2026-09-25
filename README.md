@@ -100,15 +100,16 @@ Add the system cron (`* * * * * php artisan schedule:run`) when you can. Without
 
 ## Global widget
 
-`InjectWidget` adds a small edge tab to every page for signed-in users. You don't need to change any layout. It works the same in Blade, Vue and React apps, and it follows Inertia page visits. The tab opens an offcanvas panel with:
+`InjectWidget` adds a small edge tab to every page for signed-in users. You don't need to change any layout. It works the same in Blade, Vue and React apps, and it follows Inertia page visits. The tab opens a full-screen panel with two tabs:
 
-- **Payment reminder.** Shown only while `due_amount > 0`, with no countdown. The panel opens on its own, and "Remind me later" (or closing it) hides it for `widget.reminder_minutes`.
-- **Software version.** The installed version, update status and a "Check for update" button.
-- **Cloud backup.** The last successful backup, whether a daily backup is overdue, and a "Backup now" button.
+- **License.** The payment reminder, shown only while `due_amount > 0` and with no countdown. While an amount is due the panel opens on its own, and "Remind me later" (or closing it) hides it for `widget.reminder_minutes`. Below it are the license status and the license key form (Save & verify, Refresh).
+- **Update & Backup.** The installed version, update status and "Check for update"; the last successful backup, the automatic-backup toggle and "Backup now"; and the update and backup history.
+
+With the Blade UI, `/subscription/license` and `/subscription/update` render only a placeholder, and the widget shows the same panel there as the page itself ("page mode": no close button, a Back link instead). The subscription UI therefore exists only once. With `widget.enabled` off, those pages fall back to the standalone Blade markup.
 
 When the provider reports a newer version, a **modal** offers "Update now", which runs the same step-by-step updater as the subscription page. "Later" snoozes that version for `widget.update_snooze_hours`. If the provider sets `force_update`, the modal has no "Later" button.
 
-The update and backup sections follow the `update` and `backup` access abilities. Everything is configured under `widget` in `config/subandl.php`: `enabled`, `hidden_on`, `reminder_minutes`, `update_snooze_hours` and `payment_greeting`. To open the panel from your own UI, add `data-subandl-open` to any element or call `window.SUBandLWidget.open()`.
+The License tab follows the `license` access ability (the payment reminder is shown to everyone), and the update and backup sections follow the `update` and `backup` abilities. Everything is configured under `widget` in `config/subandl.php`: `enabled`, `hidden_on`, `reminder_minutes`, `update_snooze_hours` and `payment_greeting`. To open the panel from your own UI, add `data-subandl-open` (optionally `="license"` or `="update"`) to any element or call `window.SUBandLWidget.open(tab)`. On a link, keep the `href` to `/subscription/...` as the fallback: the widget cancels the navigation only when it is loaded.
 
 The widget also sends a tab that was left open to the subscription page once the stored license becomes unusable, so the host application needs no polling of its own.
 

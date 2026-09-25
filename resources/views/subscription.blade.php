@@ -3,6 +3,14 @@
 @section('title', 'Subscription')
 
 @section('content')
+@if ($widgetPage)
+    {{-- The global widget (injected by InjectWidget) renders this page as its
+         full-screen panel, so the subscription UI exists only once. --}}
+    <div id="subandl-page" data-tab="{{ $tab }}">
+        <p class="sb-muted">Loading…</p>
+        <noscript><p class="sb-bad">This page needs JavaScript.</p></noscript>
+    </div>
+@else
     <a href="{{ $urls['home'] }}" class="sb-back">&larr; Back to {{ config('app.name') }}</a>
     <h1>Subscription</h1>
     <div class="sb-muted">{{ config('app.name') }} · version <strong id="sb-version">{{ $currentVersion }}</strong></div>
@@ -64,8 +72,10 @@
             </table>
         </section>
     @endif
+@endif
 @endsection
 
+@if (! $widgetPage)
 @push('scripts')
 <script type="module">
 {{-- Shared core (same file the Vue/React pages import). --}}
@@ -183,3 +193,4 @@ loadStatus();
 loadHistory();
 </script>
 @endpush
+@endif
