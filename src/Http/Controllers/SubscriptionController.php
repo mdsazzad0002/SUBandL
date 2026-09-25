@@ -30,9 +30,7 @@ class SubscriptionController extends Controller
         $state = LicenseState::current();
 
         if ($state->isUsable()) {
-            $home = config('subandl.home_route');
-
-            return redirect($home && Route::has($home) ? route($home) : '/');
+            return redirect($this->homeUrl());
         }
 
         return $this->render('verification_required', 'subandl::verification-required', [
@@ -378,21 +376,22 @@ class SubscriptionController extends Controller
     /* ------------------------------------------------------------------ misc */
 
     /**
-     * Clears caches, then re-verifies in the same request so the cached license
-     * state is fresh immediately.
+     * Clears caches and starts a live re-verification in the background, so the
+     * button answers at once even while the provider is slow or down. The
+     * returned license is the stored state, which a failed check never changes.
      */
-    public function clearCache(LicenseVerifier $verifier)
+    public function clearCache()
     {
         foreach (['cache:clear', 'config:clear', 'view:clear', 'route:clear'] as $command) {
             Artisan::call($command);
         }
 
-        $state = $verifier->refresh(force: true);
+        BackgroundArtisan::dispatch('subandl:license-check', ['--force']);
 
         return response()->json([
             'status' => true,
             'message' => 'Cache cleared successfully',
-            'license' => $this->formatStatus($state),
+            'license' => $this->formatStatus(LicenseState::current()),
         ]);
     }
 
@@ -468,7 +467,6 @@ class SubscriptionController extends Controller
             'licenseKey' => $state->license_key,
             'backupEnabled' => (bool) $state->backup_enabled,
             'backupIntervalHours' => (int) config('subandl.backup_interval_hours', 6),
-            'providerUrl' => config('subandl.provider_url'),
         ];
     }
 
@@ -516,6 +514,13 @@ class SubscriptionController extends Controller
         abort(403);
     }
 
+    private function homeUrl(): string
+    {
+        $home = config('subandl.home_route');
+
+        return $home && Route::has($home) ? route($home) : url('/');
+    }
+
     private const BUNDLED_PAGES = [
         'verification_required' => 'SUBandL/VerificationRequired',
         'terms' => 'SUBandL/Terms',
@@ -531,6 +536,7 @@ class SubscriptionController extends Controller
                 'license' => route('subscription.license'),
                 'update' => route('subscription.update'),
                 'terms' => route('license.terms'),
+                'home' => $this->homeUrl(),
             ],
         ];
 

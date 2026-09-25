@@ -51,12 +51,6 @@ class EnsureLicenseValid
             ], 403);
         }
 
-        // Expiry has a clear next step (renew on the subscription page); anything
-        // else (invalid, tampered, never verified) gets the explanatory page first.
-        if (in_array($state->status, ['expired', 'active'], true)) {
-            return redirect()->route('subscription.index');
-        }
-
-        return redirect()->route('license.verification-required');
+        return redirect()->route($state->redirectRouteName());
     }
 }

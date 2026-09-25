@@ -118,6 +118,18 @@ class LicenseState extends Model
     }
 
     /**
+     * Where an unusable license sends the user: expiry has a clear next step
+     * (renew on the subscription page); anything else (invalid, tampered, never
+     * verified) gets the explanatory page first.
+     */
+    public function redirectRouteName(): string
+    {
+        return in_array($this->status, ['expired', 'active'], true)
+            ? 'subscription.index'
+            : 'license.verification-required';
+    }
+
+    /**
      * The active license key — database-driven only. The configured key only seeds
      * the row once (see current()) and is never consulted again after that.
      */

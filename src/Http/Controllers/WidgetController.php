@@ -3,9 +3,7 @@
 namespace SUBandL\Http\Controllers;
 
 use Illuminate\Routing\Controller;
-use Illuminate\Support\Facades\Cache;
 use SUBandL\Backup\BackupService;
-use SUBandL\License\LicenseClient;
 use SUBandL\License\ServerHealth;
 use SUBandL\Models\LicenseState;
 use SUBandL\Support\Access;
@@ -20,15 +18,16 @@ use SUBandL\Update\UpdateApplier;
  */
 class WidgetController extends Controller
 {
-    public function state(BackupService $backups, UpdateApplier $updater)
+    /**
+     * Local data only — this runs on every page load, so it never contacts the
+     * provider. The update notice is kept fresh by subandl:update-check, which
+     * RunScheduledTasks / the scheduler start in the background.
+     */
+    public function state(BackupService $backups, UpdateApplier $updater, ServerHealth $health)
     {
         $state = LicenseState::current();
         $canUpdate = Access::allows('update');
         $canBackup = Access::allows('backup');
-
-        if ($canUpdate) {
-            $this->refreshUpdateNoticeWhenDue($state);
-        }
 
         $due = (float) ($state->due_amount ?? 0);
         $notice = UpdateNotice::get();
@@ -40,6 +39,18 @@ class WidgetController extends Controller
                 'subscription' => route('subscription.license'),
                 'update' => route('subscription.update'),
             ],
+
+            // Sends a tab left open to the subscription page once the cached
+            // license turns unusable (the middleware only sees navigations).
+            'license' => [
+                'needs_redirect' => $state->needsSubscriptionRedirect(),
+                'redirect_url' => route($state->redirectRouteName()),
+                'allowed_paths' => array_values((array) config('subandl.allowed_when_invalid', [])),
+            ],
+
+            // Set for one browser per ServerHealth window: it checks whether the
+            // provider is reachable and reports back (see ServerHealth).
+            'health_check_url' => $health->claimBrowserCheck() ? config('subandl.provider_url') : null,
 
             // Only while something is actually owed — no due, no card.
             'payment' => $due > 0 ? [
@@ -73,33 +84,6 @@ class WidgetController extends Controller
                 'next_at' => $backups->nextDueAt($state)->toDateTimeString(),
             ] : null,
         ]);
-    }
-
-    /**
-     * Keeps the update notice fresh for installs where no scheduler runs: a
-     * live check at most once per update_check_hours, only while updates can
-     * actually be applied, and never two at once.
-     */
-    private function refreshUpdateNoticeWhenDue(LicenseState $state): void
-    {
-        $hours = (int) config('subandl.update_check_hours', 2);
-
-        if ($state->last_update_check_at && $state->last_update_check_at->gt(now()->subHours($hours))) {
-            return;
-        }
-
-        if (! $state->isUsable() || $state->isMaintenanceExpired() || ! app(ServerHealth::class)->isHealthy()) {
-            return;
-        }
-
-        if (! Cache::add('subandl:widget-update-check', true, 60)) {
-            return;
-        }
-
-        UpdateNotice::record(app(LicenseClient::class)->checkForUpdate());
-
-        $state->last_update_check_at = now();
-        $state->save();
     }
 
     public function asset(string $file)

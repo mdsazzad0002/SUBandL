@@ -91,14 +91,16 @@ function relativePath() {
 }
 
 // Same pattern syntax as Laravel's Request::is().
-function isHiddenHere() {
+function matchesHere(patterns) {
     const path = relativePath();
-    return (cfg.hiddenOn || []).some((pattern) => {
+    return (patterns || []).some((pattern) => {
         const p = String(pattern).replace(/^\/+|\/+$/g, '');
         const re = new RegExp('^' + p.split('*').map((s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$');
         return re.test(path);
     });
 }
+
+const isHiddenHere = () => matchesHere(cfg.hiddenOn);
 
 /* -------------------------------------------------------------------- DOM */
 
@@ -294,9 +296,20 @@ async function refresh(force = false) {
     if (!r.ok) return; // transient failure: keep what is on screen
 
     state = r.data;
+    if (state.health_check_url) api.reportHealth(state.health_check_url);
+    if (redirectIfLicenseUnusable()) return;
     applyVisibility();
     render();
     autoPrompt();
+}
+
+// The cached license turned unusable while this tab sat open: go where the
+// middleware would send the next navigation.
+function redirectIfLicenseUnusable() {
+    const lic = state?.license;
+    if (!lic?.needs_redirect || !lic.redirect_url || matchesHere(lic.allowed_paths)) return false;
+    window.location.assign(lic.redirect_url);
+    return true;
 }
 
 function applyVisibility() {

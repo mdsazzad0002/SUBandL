@@ -3,6 +3,7 @@
 @section('title', 'Subscription')
 
 @section('content')
+    <a href="{{ $urls['home'] }}" class="sb-back">&larr; Back to {{ config('app.name') }}</a>
     <h1>Subscription</h1>
     <div class="sb-muted">{{ config('app.name') }} · version <strong id="sb-version">{{ $currentVersion }}</strong></div>
 
@@ -70,7 +71,7 @@
 {{-- Shared core (same file the Vue/React pages import). --}}
 {!! \SUBandL\Support\Assets::inline('subandl.js') !!}
 
-const props = @json(['base' => $base, 'providerUrl' => $providerUrl, 'tab' => $tab]);
+const props = @json(['base' => $base, 'tab' => $tab]);
 const api = createSubandl({ base: props.base });
 const $ = (id) => document.getElementById(id);
 const el = (tag, text, className) => Object.assign(document.createElement(tag), { textContent: text ?? '', className: className ?? '' });
@@ -178,7 +179,6 @@ $('sb-run-backup')?.addEventListener('click', (e) => busy(e.currentTarget, async
     loadStatus(); loadHistory();
 }));
 
-api.reportHealth(props.providerUrl);
 loadStatus();
 loadHistory();
 </script>

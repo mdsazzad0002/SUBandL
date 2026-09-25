@@ -12,7 +12,6 @@ export default function Subscription({
     licenseKey = '',
     backupEnabled = false,
     backupIntervalHours,
-    providerUrl,
     base = '',
     urls = {},
 }) {
@@ -42,7 +41,6 @@ export default function Subscription({
     };
 
     useEffect(() => {
-        api.reportHealth(providerUrl);
         loadStatus();
         loadHistory();
     }, [api]);

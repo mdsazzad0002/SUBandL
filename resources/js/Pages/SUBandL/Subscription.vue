@@ -13,7 +13,6 @@ const props = defineProps({
     licenseKey: String,
     backupEnabled: Boolean,
     backupIntervalHours: Number,
-    providerUrl: String,
     base: { type: String, default: '' },
     urls: { type: Object, default: () => ({}) },
 });
@@ -86,7 +85,6 @@ const runBackup = () => withBusy('backup', async () => {
 });
 
 onMounted(() => {
-    api.reportHealth(props.providerUrl);
     loadStatus();
     loadHistory();
 });

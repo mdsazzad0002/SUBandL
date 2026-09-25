@@ -20,6 +20,7 @@ class ServerHealth
 
     private const STATUS_KEY = 'subandl:server-health:status';
     private const CHECKED_AT_KEY = 'subandl:server-health:checked-at';
+    private const CLAIM_KEY = 'subandl:server-health:claim';
 
     /**
      * Fails OPEN (true) when nothing has been reported recently, so scheduled tasks
@@ -41,5 +42,21 @@ class ServerHealth
     public function lastCheckedAt(): ?Carbon
     {
         return Cache::get(self::CHECKED_AT_KEY);
+    }
+
+    /**
+     * Hands the reachability check to ONE browser once per CACHE_MINUTES, so page
+     * loads never ping the provider — at most one ping per window, whatever the
+     * number of users, tabs and refreshes.
+     */
+    public function claimBrowserCheck(): bool
+    {
+        $last = $this->lastCheckedAt();
+
+        if ($last && $last->gt(now()->subMinutes(self::CACHE_MINUTES - 5))) {
+            return false;
+        }
+
+        return Cache::add(self::CLAIM_KEY, true, now()->addMinutes(5));
     }
 }

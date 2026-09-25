@@ -110,6 +110,12 @@ When the provider reports a newer version, a **modal** offers "Update now", whic
 
 The update and backup sections follow the `update` and `backup` access abilities. Everything is configured under `widget` in `config/subandl.php`: `enabled`, `hidden_on`, `reminder_minutes`, `update_snooze_hours` and `payment_greeting`. To open the panel from your own UI, add `data-subandl-open` to any element or call `window.SUBandLWidget.open()`.
 
+The widget also sends a tab that was left open to the subscription page once the stored license becomes unusable, so the host application needs no polling of its own.
+
+### Page loads never contact the provider
+
+Every page, the widget's `/subandl/widget` snapshot and the middlewares read only the stored state. License, update and backup checks run as detached background processes (`RunScheduledTasks` or the scheduler), each throttled on its own. A provider that is slow or down therefore never delays a page, and a failed check never overwrites the last good license state. The only calls from the browser to the provider are the reachability ping, which one browser makes at most once every 30 minutes, and actions a user starts explicitly (Save License, Refresh, Check for update, Update now, Backup now).
+
 ### Daily backup guarantee
 
 With `backup_daily_minimum` on (the default), a backup runs whenever there has been no **successful** backup in the last 24 hours, even when the customer's automatic backup toggle is off. After a failure it retries every `backup_daily_retry_minutes`. It needs a usable license, and it runs from the scheduler, the web scheduler and the widget, so it works without a system cron.
@@ -181,7 +187,7 @@ Fix a behaviour once in `subandl.js`, or a style once in `subandl.css`, and all 
 
 `--ui=vue` or `--ui=react` publishes the pages to `resources/js/Pages/SUBandL/` and the core to `resources/js/subandl/`, then sets `ui.driver`. Inertia resolves the pages as `SUBandL/Subscription`, `SUBandL/VerificationRequired` and `SUBandL/Terms`. After publishing, you can wrap them in your app layout, for example with `defineOptions({ layout })` in Vue or `Page.layout = …` in React. Re-run the publish with `--force` to pick up package updates. If you do not have Inertia installed, the driver falls back to Blade.
 
-Every page receives the same props: `currentVersion`, `tab`, `canUpdate`, `canBackup`, `licenseKey`, `backupEnabled`, `backupIntervalHours`, `providerUrl`, `base` and `urls {license, update, terms}`. The verification page gets `status` and `message` instead. Custom `inertia` pages receive these props too.
+Every page receives the same props: `currentVersion`, `tab`, `canUpdate`, `canBackup`, `licenseKey`, `backupEnabled`, `backupIntervalHours`, `base` and `urls {license, update, terms}`. The verification page gets `status` and `message` instead. Custom `inertia` pages receive these props too.
 
 To restyle the Blade pages: `php artisan vendor:publish --tag=subandl-views`.
 
