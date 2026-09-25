@@ -1,14 +1,14 @@
 /**
  * SUBandL global widget — injected into every page by InjectWidget.
  *
- *   • edge tab → full-screen panel with two tabs:
+ *   • edge tab → offcanvas panel (1000px, max 75% wide) with two tabs:
  *       Subscription    — payment reminder (only while an amount is due),
  *                         license status, license key form
  *       Update & Backup — version / update, backup (toggle, run), history
  *   • modal whenever a newer version is available, to apply it right there
  *
  * The /subscription/* pages render only a #subandl-page placeholder; the
- * widget then shows the same panel in "page mode" (no close button), so the
+ * widget then shows the same panel full screen in "page mode" (no close button), so the
  * subscription UI exists exactly once.
  *
  * Framework-agnostic (plain DOM), so it behaves the same inside Blade, Vue or
@@ -146,6 +146,7 @@ root.innerHTML = `
     <button type="button" class="sbw-tab" data-sbw="open" aria-label="Subscription, updates and backup">
         ${icons.shield}<span class="sbw-dot" hidden></span>
     </button>
+    <div class="sbw-backdrop" data-sbw="close"></div>
     <aside class="sbw-panel" role="dialog" aria-modal="true" aria-labelledby="sbw-title" tabindex="-1">
         <header class="sbw-head">
             <div class="sbw-head-in">
