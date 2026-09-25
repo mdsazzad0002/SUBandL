@@ -70,6 +70,11 @@ return [
     'widget' => [
         'enabled' => true,
 
+        // The floating tab on the screen edge that opens the panel. Turn it off
+        // when the app opens the panel itself (data-subandl-open links); the
+        // panel still opens on its own for a payment due or a new version.
+        'edge_tab' => true,
+
         // Request::is patterns where the widget stays hidden.
         'hidden_on' => ['login', 'register', 'password/*', 'subscription', 'subscription/*', 'license/*', 'terms'],
 

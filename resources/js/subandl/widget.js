@@ -140,7 +140,7 @@ const icons = {
 };
 
 const root = document.createElement('div');
-root.className = 'sbw' + (pageMode ? ' sbw-page' : '');
+root.className = 'sbw' + (pageMode ? ' sbw-page' : '') + (cfg.edgeTab === false ? ' sbw-notab' : '');
 root.hidden = true;
 root.innerHTML = `
     <button type="button" class="sbw-tab" data-sbw="open" aria-label="Subscription, updates and backup">

@@ -54,6 +54,7 @@ class InjectWidget
             'hiddenOn' => array_values((array) config('subandl.widget.hidden_on', [])),
             'reminderMinutes' => (int) config('subandl.widget.reminder_minutes', 10),
             'updateSnoozeHours' => (int) config('subandl.widget.update_snooze_hours', 6),
+            'edgeTab' => (bool) config('subandl.widget.edge_tab', true),
         ];
 
         return sprintf(

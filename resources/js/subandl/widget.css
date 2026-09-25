@@ -78,6 +78,7 @@ html.sbw-noscroll, html.sbw-noscroll body { overflow: hidden !important; }
 
 /* Page mode: /subscription/* shows the panel as the page itself */
 .sbw-page .sbw-tab, .sbw-page .sbw-close, .sbw-page .sbw-backdrop { display: none; }
+.sbw-notab .sbw-tab { display: none; }
 .sbw-page .sbw-panel { left: 0; width: auto; max-width: none; box-shadow: none; }
 
 /* Cards */
