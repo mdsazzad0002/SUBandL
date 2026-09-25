@@ -93,6 +93,10 @@ class SubscriptionController extends Controller
 
     public function saveLicense(Request $request, LicenseVerifier $verifier)
     {
+        if ($denied = $this->denyUnless('license')) {
+            return $denied;
+        }
+
         $request->validate(['license' => ['required', 'string', 'max:255']]);
 
         $key = trim($request->input('license'));
@@ -145,6 +149,10 @@ class SubscriptionController extends Controller
 
     public function toggleBackup(Request $request)
     {
+        if ($denied = $this->denyUnless('backup')) {
+            return $denied;
+        }
+
         $request->validate(['enabled' => ['required', 'boolean']]);
 
         $state = LicenseState::current();
@@ -161,6 +169,10 @@ class SubscriptionController extends Controller
      */
     public function runBackup(BackupService $service)
     {
+        if ($denied = $this->denyUnless('backup')) {
+            return $denied;
+        }
+
         if ($service->isRunning()) {
             return response()->json(['ok' => false, 'running' => true, 'message' => 'A backup is already running.'], 409);
         }
@@ -273,6 +285,10 @@ class SubscriptionController extends Controller
      */
     public function runUpdate(LicenseClient $client, UpdateApplier $applier)
     {
+        if ($denied = $this->denyUnless('update')) {
+            return $denied;
+        }
+
         $lock = Cache::lock(SUBandL::UPDATE_LOCK, 30 * 60);
 
         if (! $lock->get()) {
@@ -471,6 +487,24 @@ class SubscriptionController extends Controller
         }
 
         return $driver;
+    }
+
+    /**
+     * JSON 403 for an action the user's access doesn't cover. The pages already
+     * hide these buttons; this stops a direct request to the endpoint. Carries
+     * both `status` and `ok`, the two result keys the endpoints use.
+     */
+    private function denyUnless(string $area): ?\Illuminate\Http\JsonResponse
+    {
+        if (Access::allows($area)) {
+            return null;
+        }
+
+        return response()->json([
+            'status' => false,
+            'ok' => false,
+            'message' => 'You do not have permission to do this.',
+        ], 403);
     }
 
     private function forbidden()
