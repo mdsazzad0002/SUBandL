@@ -5,6 +5,7 @@ namespace SUBandL\Console;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 use SUBandL\License\ServerHealth;
+use SUBandL\Models\ActivityLog;
 use SUBandL\Models\LicenseState;
 use SUBandL\SUBandL;
 use SUBandL\Support\UpdateNotice;
@@ -18,12 +19,6 @@ class UpdateCheckCommand extends Command
     public function handle(SUBandL $subandl, ServerHealth $health): int
     {
         $force = (bool) $this->option('force');
-
-        if (! $force && ! $health->isHealthy()) {
-            $this->warn('Skipping update check: provider server is unreachable.');
-
-            return self::SUCCESS;
-        }
 
         $state = LicenseState::current();
         $hours = (int) config('subandl.update_check_hours', 2);
@@ -40,8 +35,14 @@ class UpdateCheckCommand extends Command
             return self::SUCCESS;
         }
 
-        if ($state->isMaintenanceExpired()) {
-            $this->warn('Skipping update check: update/support period has expired.');
+        // Lifetime plans without an update subscription still check: the new
+        // version is announced (locked, with its price) but never applied.
+
+        // Health first: no live update check (and so no popup data) against a
+        // provider that doesn't answer its ping twice.
+        $gate = $health->gate('update check', respectBackoff: ! $force);
+        if (! $gate['ok']) {
+            $this->warn('Skipping update check: ' . $gate['message']);
 
             return self::SUCCESS;
         }
@@ -51,12 +52,20 @@ class UpdateCheckCommand extends Command
 
         $check = $subandl->checkUpdate();
         UpdateNotice::record($check);
+        ActivityLog::record('update-check', (bool) ($check['ok'] ?? false), match (true) {
+            ! ($check['ok'] ?? false) => 'Update check failed: ' . ($check['message'] ?? 'unknown error') . '.',
+            (bool) ($check['locked'] ?? false) => 'v' . $check['latest_version'] . ' available (needs the monthly update subscription).',
+            (bool) ($check['update_available'] ?? false) => 'v' . $check['latest_version'] . ' available.',
+            default => 'Up to date (v' . config('subandl.version') . ').',
+        });
 
         // By default a new version is only announced (the widget's update modal);
         // the customer applies it. auto_apply installs it from here unattended.
-        if (! config('subandl.update_auto_apply', false)) {
+        if (! config('subandl.update_auto_apply', false) || ($check['locked'] ?? false)) {
             if (! ($check['ok'] ?? false)) {
                 $this->warn('Update check failed: ' . ($check['message'] ?? 'unknown error'));
+            } elseif ($check['locked'] ?? false) {
+                $this->info('Update v' . ($check['latest_version'] ?? '?') . ' exists but needs a monthly update subscription.');
             } elseif ($check['update_available'] ?? false) {
                 $this->info('Update available: v' . ($check['latest_version'] ?? '?') . ' (waiting for the customer to apply it).');
             } else {

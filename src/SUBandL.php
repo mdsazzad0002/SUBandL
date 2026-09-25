@@ -86,7 +86,18 @@ class SUBandL
         }
 
         try {
+            // Never start changing files and the database against a provider
+            // that can't be reached; automatic runs back off for 30+ minutes.
+            $probe = app(License\ServerHealth::class)->probe(task: 'update');
+            if (! $probe['ok']) {
+                return ['ok' => false, 'update_available' => false, 'message' => $probe['message'], 'retry_at' => $probe['retry_at']];
+            }
+
             $info = $this->checkUpdate();
+
+            if (($info['locked'] ?? false)) {
+                return ['ok' => false, 'locked' => true, 'update_available' => false, 'message' => 'This version needs an active monthly update subscription.'];
+            }
 
             if (! ($info['ok'] ?? false) || ! ($info['update_available'] ?? false)) {
                 return ['ok' => true, 'update_available' => false, 'message' => $info['message'] ?? 'No update available.', 'version' => $this->version()];

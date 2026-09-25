@@ -94,7 +94,7 @@ Open `/subscription`. Middleware, routes, the scheduler and the UI all register 
 | Commands | `subandl:install`, `subandl:status`, `subandl:license-check [--force]`, `subandl:update-check [--force]`, `subandl:backup [--force]` |
 | Events | `SUBandL\Events\LicenseVerified`, `UpdateFinished`, `BackupFinished` |
 
-Add the system cron (`* * * * * php artisan schedule:run`) when you can. Without it, the web scheduler still triggers the checks from logged-in traffic.
+Add the system cron (`* * * * * php artisan schedule:run`) when you can. Without it, the web scheduler still triggers the checks from page visits.
 
 ---
 
@@ -102,12 +102,14 @@ Add the system cron (`* * * * * php artisan schedule:run`) when you can. Without
 
 `InjectWidget` adds a small edge tab to every page for signed-in users. You don't need to change any layout. It works the same in Blade, Vue and React apps, and it follows Inertia page visits. The tab opens an offcanvas panel (1000px wide, at most 75% of the screen, full width on phones) with two tabs:
 
-- **License.** The payment reminder, shown only while `due_amount > 0` and with no countdown. While an amount is due the panel opens on its own, and "Remind me later" (or closing it) hides it for `widget.reminder_minutes`. Below it are the license status and the license key form (Save & verify, Refresh).
+- **License.** The payment details (amount due, open invoices, paid-through date, how to pay), then the license status and the license key form (Save & verify, Refresh).
 - **Update & Backup.** The installed version, update status and "Check for update"; the last successful backup, the automatic-backup toggle and "Backup now"; and the update and backup history.
 
 With the Blade UI, `/subscription/license` and `/subscription/update` render only a placeholder, and the widget shows the same panel there full screen as the page itself ("page mode": no close button, a Back link instead). The subscription UI therefore exists only once. With `widget.enabled` off, those pages fall back to the standalone Blade markup.
 
-When the provider reports a newer version, a **modal** offers "Update now", which runs the same step-by-step updater as the subscription page. "Later" snoozes that version for `widget.update_snooze_hours`. If the provider sets `force_update`, the modal has no "Later" button.
+**Payment reminder.** While money is owed, a payment modal pops up on its own. Once the payment is late (the grace period is running) it comes back every `widget.reminder_minutes` (10), and a banner at the bottom of the screen stays until the payment arrives, so "Remind me later" hides only the popup. Before the due date the popup comes back every `widget.due_reminder_hours` (24) instead. While a payment is owed the license is re-verified every `verify_cache_minutes_when_due` (30), so a payment unlocks the app within minutes.
+
+When the provider reports a newer version, a **modal** offers "Update now", which runs the same step-by-step updater as the subscription page: check the provider server, back up and install, then reload. "Later" snoozes that version for `widget.update_snooze_hours`. If the provider sets `force_update`, the modal has no "Later" button.
 
 The License tab follows the `license` access ability (the payment reminder is shown to everyone), and the update and backup sections follow the `update` and `backup` abilities. Everything is configured under `widget` in `config/subandl.php`: `enabled`, `edge_tab` (the floating edge button; turn it off when your UI opens the panel with `data-subandl-open`), `hidden_on`, `reminder_minutes`, `update_snooze_hours` and `payment_greeting`. To open the panel from your own UI, add `data-subandl-open` (optionally `="license"` or `="update"`) to any element or call `window.SUBandLWidget.open(tab)`. On a link, keep the `href` to `/subscription/...` as the fallback: the widget cancels the navigation only when it is loaded.
 
@@ -117,9 +119,26 @@ The widget also sends a tab that was left open to the subscription page once the
 
 Every page, the widget's `/subandl/widget` snapshot and the middlewares read only the stored state. License, update and backup checks run as detached background processes (`RunScheduledTasks` or the scheduler), each throttled on its own. A provider that is slow or down therefore never delays a page, and a failed check never overwrites the last good license state. The only calls from the browser to the provider are the reachability ping, which one browser makes at most once every 30 minutes, and actions a user starts explicitly (Save License, Refresh, Check for update, Update now, Backup now).
 
+### Plans: monthly and lifetime
+
+The provider decides, and SUBandL shows it:
+
+- **Monthly.** The license runs to its paid-through date. Every paid monthly fee moves that date one month on. After it passes (or after an unpaid fee's due date), the app keeps working for the grace days with a reminder, then pauses until the fee is paid. Updates are always included.
+- **Lifetime.** The license never expires. New versions come only with the monthly **update subscription**. Without it the update modal still announces a new version, marked as locked with its monthly price, but the version can't be installed.
+
+### Health check before every live call
+
+Every live call is preceded by a server-side ping to the provider (`/api/ping`): license checks, update checks (the source of the update popup), backups and updates. While the provider is unhealthy, no live call is made at all. The ping and the live call are each tried at least twice (`health_attempts`, `live_attempts`). If they still fail, automatic work waits `health_retry_minutes` (at least 30) and then tries again by itself. An explicit click (Check for update, Backup now, Update now) probes again right away.
+
+Every step is written to the **activity log** (`license_activity_logs`), which appears in the History table on the Update & Backup page next to backups and updates. For example: "Provider unreachable after 2 attempts (Connection timed out); update check skipped. Next try after 21:48", or "/check-update answered on attempt 2". The Update card also shows whether the provider server is reachable and when the next try is.
+
+### Instant check on a device or domain change
+
+The known device (machine + install folder) and domain are stored in the database (`license_installations.fingerprint` / `domain`). When a request comes from a different device or domain, the license is re-verified live right then (`verify_on_identity_change`). A copied install is caught on its first page load, and a legitimate move is confirmed just as fast. A first visit, a fresh install or an upgrade only records the baseline, without contacting the provider. The live call gives up after `identity_check_timeout` seconds (5); while the provider is down the page carries on with the stored state, and the check is retried after the health back-off. Background checks send the stored domain, so the provider's domain binding applies to them too. IP addresses and `localhost` never count as a domain.
+
 ### Daily backup guarantee
 
-With `backup_daily_minimum` on (the default), a backup runs whenever there has been no **successful** backup in the last 24 hours, even when the customer's automatic backup toggle is off. After a failure it retries every `backup_daily_retry_minutes`. It needs a usable license, and it runs from the scheduler, the web scheduler and the widget, so it works without a system cron.
+Automatic backups (customer toggle on) run every `backup_interval_hours` (8, never less than `backup_min_interval_hours`). With `backup_daily_minimum` on (the default), a backup also runs whenever there has been no **successful** backup in the last 24 hours, even when the customer's automatic backup toggle is off. After a failure it retries every `backup_daily_retry_minutes`. It needs a usable license, and it runs from the scheduler, the web scheduler and the widget, so it works without a system cron.
 
 ### Updates: notify, then apply
 

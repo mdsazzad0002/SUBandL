@@ -93,6 +93,12 @@ export function createSubandl({ base = '' } = {}) {
 
         refreshLicense: () => request('POST', '/license/check'),
 
+        /** Server-side health check of the provider before an update. */
+        async preflight() {
+            const r = await request('POST', '/license/update/preflight');
+            return { ok: r.ok && !!r.data.ok, message: r.data.message || (r.ok ? '' : 'The provider server is not reachable.'), retryAt: r.data.retry_at || null };
+        },
+
         async checkUpdate() {
             const { data } = await request('POST', '/license/update/check');
             return data;
@@ -112,6 +118,15 @@ export function createSubandl({ base = '' } = {}) {
 
                 if (r.status === 409) {
                     return { ok: false, message: r.data.message || 'An update is already running.' };
+                }
+
+                // Provider unreachable (retry later) or update not included in the plan:
+                // a definite answer, nothing is running in the background.
+                if (r.status === 503 && r.data.retry_at !== undefined) {
+                    return { ok: false, message: r.data.message, retryAt: r.data.retry_at };
+                }
+                if (r.status === 402) {
+                    return { ok: false, locked: true, message: r.data.message };
                 }
 
                 // The request died (proxy/worker timeout) — the step may still finish.
@@ -163,12 +178,14 @@ export function createSubandl({ base = '' } = {}) {
             return { ok: !!r.data.ok, message: r.data.message || 'Backup finished.' };
         },
 
-        /** Update + backup history merged, newest first. */
-        async history(limit = 30) {
-            const [u, b] = await Promise.all([
+        /** Update + backup history and the activity log merged, newest first. */
+        async history(limit = 60) {
+            const [u, b, a] = await Promise.all([
                 request('GET', '/license/update/history'),
                 request('GET', '/license/backup/history'),
+                request('GET', '/license/activity'),
             ]);
+            const ACTIVITY = { health: 'Server health', license: 'License check', 'update-check': 'Update check', update: 'Update', backup: 'Backup' };
 
             return [
                 ...(u.data.history || []).map((h) => ({
@@ -182,6 +199,13 @@ export function createSubandl({ base = '' } = {}) {
                     key: 'b' + h.id,
                     at: h.created_at,
                     type: 'Backup',
+                    ok: h.ok,
+                    message: h.message || '',
+                })),
+                ...((a.data && a.data.activity) || []).map((h) => ({
+                    key: 'a' + h.id,
+                    at: h.created_at,
+                    type: ACTIVITY[h.type] || h.type,
                     ok: h.ok,
                     message: h.message || '',
                 })),
@@ -217,15 +241,16 @@ export const LICENSE_FIELDS = [
     ['status', 'Status'],
     ['client_name', 'Client'],
     ['subscription_type', 'Plan'],
-    ['expires_at', 'Expires'],
-    ['update_support_expires_at', 'Update support until'],
+    ['paid_through', 'Paid through'],
+    ['monthly_fee', 'Monthly fee'],
     ['due_amount', 'Due amount'],
+    ['next_due_date', 'Next due date'],
     ['last_verified_at', 'Last verified'],
 ];
 
 export const TERMS = [
     'Each license key is bound to a single installation. Moving to a new server requires the provider to release the binding.',
     'This software periodically contacts the provider to verify the license, check for updates and, when enabled, upload database backups.',
-    'Updates are applied only while the update/support period is active.',
+    'Monthly plans include updates while the subscription is paid. Lifetime plans receive new versions only with an active monthly update subscription.',
     'An expired or invalid license pauses access to the application; it never deletes data.',
 ];

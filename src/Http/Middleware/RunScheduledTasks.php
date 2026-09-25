@@ -9,7 +9,7 @@ use SUBandL\Support\BackgroundArtisan;
 
 /**
  * Poor-man's cron: fires the license, update and backup checks from
- * authenticated web traffic, as detached processes, so they happen even on
+ * web traffic (page visits), as detached processes, so they happen even on
  * hosts with no system cron. These TTLs are only how often a spawn is
  * attempted — every command self-throttles its real provider work.
  */
@@ -23,7 +23,12 @@ class RunScheduledTasks
 
     public function handle(Request $request, Closure $next)
     {
-        if (! config('subandl.middleware.web_scheduler', true) || ! $request->user()) {
+        // Any page visit counts (signed in or not): the daily backup must go
+        // out as soon as someone opens the site. Each spawn is throttled here
+        // and every command also throttles itself.
+        if (! config('subandl.middleware.web_scheduler', true)
+            || ! $request->isMethod('GET')
+            || $request->routeIs('subandl.asset')) {
             return $next($request);
         }
 

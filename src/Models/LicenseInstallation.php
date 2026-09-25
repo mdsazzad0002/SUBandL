@@ -6,7 +6,7 @@ use Illuminate\Database\Eloquent\Model;
 
 class LicenseInstallation extends Model
 {
-    protected $fillable = ['installation_uuid', 'signing_secret', 'domain'];
+    protected $fillable = ['installation_uuid', 'signing_secret', 'domain', 'fingerprint'];
 
     public function getTable()
     {

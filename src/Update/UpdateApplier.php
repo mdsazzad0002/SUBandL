@@ -125,10 +125,30 @@ class UpdateApplier
         $zipPath = $stagingDir . DIRECTORY_SEPARATOR . 'update-' . now()->format('YmdHis') . '.zip';
 
         try {
-            // Streamed to disk rather than held in memory.
-            $response = Http::timeout((int) config('subandl.update.download_timeout', 300))
-                ->sink($zipPath)
-                ->get($downloadUrl);
+            // Streamed to disk rather than held in memory. Tried at least twice
+            // on a connection error or 5xx before the update gives up.
+            $attempts = max(2, (int) config('subandl.live_attempts', 2));
+            for ($attempt = 1; ; $attempt++) {
+                try {
+                    $response = Http::timeout((int) config('subandl.update.download_timeout', 300))
+                        ->sink($zipPath)
+                        ->get($downloadUrl);
+
+                    if (! $response->serverError() || $attempt >= $attempts) {
+                        break;
+                    }
+                    $reason = 'HTTP ' . $response->status();
+                } catch (\Illuminate\Http\Client\ConnectionException $e) {
+                    if ($attempt >= $attempts) {
+                        \SUBandL\Models\ActivityLog::record('update', false, "Package download failed after {$attempt} attempts: {$e->getMessage()}");
+                        throw $e;
+                    }
+                    $reason = $e->getMessage();
+                }
+
+                \SUBandL\Models\ActivityLog::record('update', false, "Package download attempt {$attempt} failed ({$reason}); retrying.");
+                sleep((int) config('subandl.live_retry_delay_seconds', 2));
+            }
 
             if (! $response->successful()) {
                 return ['ok' => false, 'message' => 'Update package download failed (HTTP ' . $response->status() . ').'];

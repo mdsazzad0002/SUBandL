@@ -12,6 +12,7 @@ use SUBandL\Backup\BackupService;
 use SUBandL\License\LicenseClient;
 use SUBandL\License\LicenseVerifier;
 use SUBandL\License\ServerHealth;
+use SUBandL\Models\ActivityLog;
 use SUBandL\Models\BackupHistory;
 use SUBandL\Models\LicenseState;
 use SUBandL\Models\UpdateHistory;
@@ -31,6 +32,12 @@ class SubscriptionController extends Controller
 
         if ($state->isUsable()) {
             return redirect(self::homeUrl());
+        }
+
+        // Signed-in users get the Update & Backup page (or the License tab)
+        // instead; this plain page is only the fallback.
+        if (auth()->check() && ($route = $state->redirectRouteName()) !== 'license.verification-required') {
+            return redirect()->route($route);
         }
 
         return $this->render('verification_required', 'subandl::verification-required', [
@@ -147,7 +154,7 @@ class SubscriptionController extends Controller
 
     public function toggleBackup(Request $request)
     {
-        if ($denied = $this->denyUnless('backup')) {
+        if ($denied = $this->denyUnless('backup') ?? $this->denyWithoutLicense()) {
             return $denied;
         }
 
@@ -167,7 +174,7 @@ class SubscriptionController extends Controller
      */
     public function runBackup(BackupService $service)
     {
-        if ($denied = $this->denyUnless('backup')) {
+        if ($denied = $this->denyUnless('backup') ?? $this->denyWithoutLicense()) {
             return $denied;
         }
 
@@ -243,13 +250,13 @@ class SubscriptionController extends Controller
      */
     public function checkUpdate(Request $request, LicenseClient $client, ServerHealth $health)
     {
+        if ($denied = $this->denyWithoutLicense()) {
+            return $denied;
+        }
+
         $state = LicenseState::current();
 
         if ($request->boolean('automatic')) {
-            if (! $health->isHealthy()) {
-                return response()->json(['ok' => false, 'update_available' => false, 'message' => 'Provider unreachable.']);
-            }
-
             $hours = (int) config('subandl.update_check_hours', 2);
             if ($state->last_update_check_at && $state->last_update_check_at->gt(now()->subHours($hours))) {
                 // Not due for a live check — answer from the last one instead of
@@ -265,8 +272,17 @@ class SubscriptionController extends Controller
             }
         }
 
+        // Health first — a click probes even during the back-off.
+        $gate = $health->gate('update check', respectBackoff: $request->boolean('automatic'));
+        if (! $gate['ok']) {
+            return response()->json(['ok' => false, 'update_available' => false, 'message' => $gate['message'], 'retry_at' => $gate['retry_at']]);
+        }
+
         $result = $client->checkForUpdate(config('subandl.version', '1.0.0'));
         UpdateNotice::record($result);
+        ActivityLog::record('update-check', (bool) ($result['ok'] ?? false), ($result['ok'] ?? false)
+            ? (($result['update_available'] ?? false) ? 'v' . $result['latest_version'] . ' available (checked by user).' : 'Up to date (checked by user).')
+            : 'Update check failed: ' . ($result['message'] ?? 'unknown error') . '.');
 
         $state->last_update_check_at = now();
         $state->save();
@@ -283,7 +299,7 @@ class SubscriptionController extends Controller
      */
     public function runUpdate(LicenseClient $client, UpdateApplier $applier)
     {
-        if ($denied = $this->denyUnless('update')) {
+        if ($denied = $this->denyUnless('update') ?? $this->denyWithoutLicense()) {
             return $denied;
         }
 
@@ -302,7 +318,29 @@ class SubscriptionController extends Controller
         $fromVersion = (string) config('subandl.version', '1.0.0');
 
         try {
+            // Health-check the provider before touching files or the database.
+            $probe = app(ServerHealth::class)->probe(task: 'update');
+            if (! $probe['ok']) {
+                return response()->json([
+                    'status' => false,
+                    'extracted' => false,
+                    'update_available' => false,
+                    'message' => $probe['message'],
+                    'retry_at' => $probe['retry_at'],
+                ], 503);
+            }
+
             $result = $client->checkForUpdate($fromVersion);
+
+            if ($result['locked'] ?? false) {
+                return response()->json([
+                    'status' => false,
+                    'locked' => true,
+                    'extracted' => false,
+                    'update_available' => false,
+                    'message' => 'This version needs an active monthly update subscription.',
+                ], 402);
+            }
 
             if (! ($result['ok'] ?? false) || ! ($result['update_available'] ?? false)) {
                 return response()->json([
@@ -343,6 +381,21 @@ class SubscriptionController extends Controller
         }
     }
 
+    /**
+     * Step one of the update modal: is the provider reachable from this
+     * server right now? A failure starts the 30-minute back-off.
+     */
+    public function updatePreflight(ServerHealth $health)
+    {
+        if ($denied = $this->denyUnless('update') ?? $this->denyWithoutLicense()) {
+            return $denied;
+        }
+
+        $probe = $health->probe(task: 'update');
+
+        return response()->json($probe, $probe['ok'] ? 200 : 503);
+    }
+
     public function updateStatus(UpdateApplier $applier)
     {
         $state = LicenseState::current();
@@ -371,6 +424,31 @@ class SubscriptionController extends Controller
             ]);
 
         return response()->json(['history' => $history]);
+    }
+
+    /**
+     * The activity log (health checks, live checks, retries, skips) for the
+     * Update & Backup page's history.
+     */
+    public function activity()
+    {
+        if (! Access::allows('update') && ! Access::allows('backup')) {
+            return response()->json(['activity' => []]);
+        }
+
+        try {
+            $rows = ActivityLog::query()->latest('id')->limit(40)->get(['id', 'type', 'ok', 'message', 'created_at']);
+        } catch (\Throwable $e) {
+            $rows = collect();
+        }
+
+        return response()->json(['activity' => $rows->map(fn ($row) => [
+            'id' => $row->id,
+            'type' => $row->type,
+            'ok' => $row->ok,
+            'message' => $row->message,
+            'created_at' => $row->created_at?->toDateTimeString(),
+        ])]);
     }
 
     /* ------------------------------------------------------------------ misc */
@@ -411,6 +489,10 @@ class SubscriptionController extends Controller
             'client_email' => $state->client_email,
             'expires_at' => optional($state->expires_at)->toDateTimeString(),
             'update_support_expires_at' => optional($state->update_support_expires_at)->toDateTimeString(),
+            'updates_included' => $state->updatesIncluded(),
+            'billing' => $state->billing(),
+            'paid_through' => $state->billing()['paid_through'] ?? null,
+            'next_due_date' => $state->billing()['next_due_date'] ?? null,
             'grace_days' => $state->grace_days,
             'in_grace_period' => $state->in_grace_period,
             'grace_ends_at' => optional($state->grace_ends_at)->toDateString(),
@@ -430,7 +512,7 @@ class SubscriptionController extends Controller
             'last_backup_status' => $state->last_backup_status,
             'last_backup_message' => $state->last_backup_message,
             'message' => $state->last_verification_error,
-            'next_check_at' => $this->nextDueAt($state->last_verified_at, (int) config('subandl.verify_cache_minutes', 720))->toDateTimeString(),
+            'next_check_at' => $this->nextDueAt($state->last_verified_at, $state->needsAttention() ? (int) config('subandl.verify_cache_minutes_when_due', 30) : (int) config('subandl.verify_cache_minutes', 720))->toDateTimeString(),
             'next_update_check_at' => $this->nextDueAt($state->last_update_check_at, (int) config('subandl.update_check_hours', 2) * 60)->toDateTimeString(),
             'next_backup_at' => $backups->nextDueAt($state)->toDateTimeString(),
         ];
@@ -466,7 +548,7 @@ class SubscriptionController extends Controller
             'canBackup' => $canBackup,
             'licenseKey' => $state->license_key,
             'backupEnabled' => (bool) $state->backup_enabled,
-            'backupIntervalHours' => (int) config('subandl.backup_interval_hours', 6),
+            'backupIntervalHours' => BackupService::intervalHours(),
             // Blade only: let the global widget render the page as its panel.
             'widgetPage' => (bool) config('subandl.widget.enabled', true),
         ];
@@ -504,6 +586,24 @@ class SubscriptionController extends Controller
             'status' => false,
             'ok' => false,
             'message' => 'You do not have permission to do this.',
+        ], 403);
+    }
+
+    /**
+     * Update and backup work only with a valid license — the buttons are
+     * disabled in the UI, and this refuses direct calls too.
+     */
+    private function denyWithoutLicense(): ?\Illuminate\Http\JsonResponse
+    {
+        if (LicenseState::current()->isUsable()) {
+            return null;
+        }
+
+        return response()->json([
+            'status' => false,
+            'ok' => false,
+            'unlicensed' => true,
+            'message' => 'A valid license is required for updates and backups.',
         ], 403);
     }
 

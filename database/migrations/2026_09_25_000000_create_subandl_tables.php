@@ -18,6 +18,7 @@ return new class extends Migration
             'installation_uuid' => fn (Blueprint $t) => $t->uuid('installation_uuid')->unique(),
             'signing_secret' => fn (Blueprint $t) => $t->string('signing_secret'),
             'domain' => fn (Blueprint $t) => $t->string('domain')->nullable(),
+            'fingerprint' => fn (Blueprint $t) => $t->string('fingerprint', 64)->nullable(),
         ]);
 
         $this->ensure(config('subandl.tables.states', 'license_states'), [

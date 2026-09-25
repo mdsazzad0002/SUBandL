@@ -99,11 +99,49 @@ class LicenseState extends Model
 
     public function isMaintenanceExpired(): bool
     {
-        if (! $this->update_support_expires_at) {
-            return false;
+        return ! $this->updatesIncluded();
+    }
+
+    /**
+     * The provider's billing summary from the last verification (plan, fee,
+     * due, paid-through, grace, open invoices). Empty for providers that
+     * don't send one.
+     *
+     * @return array<string, mixed>
+     */
+    public function billing(): array
+    {
+        $billing = $this->last_verification_response['billing'] ?? null;
+
+        return is_array($billing) ? $billing : [];
+    }
+
+    /**
+     * May this install receive new versions? Monthly plans: while active.
+     * Lifetime plans: only with a paid monthly update subscription.
+     */
+    public function updatesIncluded(): bool
+    {
+        $flag = $this->last_verification_response['updates_included'] ?? null;
+
+        if ($flag !== null) {
+            return (bool) $flag;
         }
 
-        return $this->update_support_expires_at->lt(now());
+        // Older providers: fall back to the update-support date, if any.
+        return ! $this->update_support_expires_at || $this->update_support_expires_at->gte(now());
+    }
+
+    /** Payment is late (past the paid-through date or a fee's due date). */
+    public function isPaymentLate(): bool
+    {
+        return (bool) ($this->billing()['payment_late'] ?? $this->in_grace_period);
+    }
+
+    /** Money is owed, grace is running, or the license is unusable. */
+    public function needsAttention(): bool
+    {
+        return (float) $this->due_amount > 0 || $this->in_grace_period || $this->isPaymentLate() || ! $this->isUsable();
     }
 
     /**
@@ -118,14 +156,20 @@ class LicenseState extends Model
     }
 
     /**
-     * Where an unusable license sends the user: expiry has a clear next step
-     * (renew on the subscription page); anything else (invalid, tampered, never
-     * verified) gets the explanatory page first.
+     * Where an unusable license sends the user: the Update & Backup page
+     * (full-screen panel), which explains the license problem and keeps
+     * backup and update status in reach, with the License tab one click
+     * away. Users allowed neither there nor on the License tab get the plain
+     * explanatory page.
      */
     public function redirectRouteName(): string
     {
-        return in_array($this->status, ['expired', 'active'], true)
-            ? 'subscription.index'
+        if (\SUBandL\Support\Access::allows('update') || \SUBandL\Support\Access::allows('backup')) {
+            return 'subscription.update';
+        }
+
+        return \SUBandL\Support\Access::allows('license')
+            ? 'subscription.license'
             : 'license.verification-required';
     }
 

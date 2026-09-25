@@ -9,12 +9,14 @@ use Illuminate\Support\Facades\Process;
 use SUBandL\Events\BackupFinished;
 use SUBandL\License\LicenseClient;
 use SUBandL\License\ServerHealth;
+use SUBandL\Models\ActivityLog;
 use SUBandL\Models\BackupHistory;
 use SUBandL\Models\LicenseState;
 
 /**
  * Uploads a database backup to the provider using its chunked
- * initialize/chunk/complete flow. Runs every backup_interval_hours when the
+ * initialize/chunk/complete flow. Runs every intervalHours() (never less than
+ * backup_min_interval_hours, default 8) when the
  * customer has opted in via the subscription page toggle
  * (LicenseState::backup_enabled), and — regardless of that toggle — whenever
  * there has been no successful backup for 24 hours (backup_daily_minimum).
@@ -94,6 +96,20 @@ class BackupService
         }
     }
 
+    /**
+     * Hours between automatic backups: backup_interval_hours, but never less
+     * than backup_min_interval_hours (8 by default) — a backup is a full
+     * database dump, so it is kept well apart.
+     */
+    public static function intervalHours(): int
+    {
+        return max(
+            (int) config('subandl.backup_min_interval_hours', 8),
+            (int) config('subandl.backup_interval_hours', 8),
+            1,
+        );
+    }
+
     public function nextDueAt(?LicenseState $state = null): Carbon
     {
         $state ??= LicenseState::current();
@@ -115,7 +131,7 @@ class BackupService
     private function scheduledDueAt(LicenseState $state): Carbon
     {
         return $state->last_backup_at
-            ? $state->last_backup_at->copy()->addHours((int) config('subandl.backup_interval_hours', 6))
+            ? $state->last_backup_at->copy()->addHours(self::intervalHours())
             : now();
     }
 
@@ -165,6 +181,10 @@ class BackupService
             return ['ok' => false, 'running' => true, 'message' => 'A backup is already running.'];
         }
 
+        if (! $state->isUsable()) {
+            return ['ok' => false, 'skipped' => true, 'message' => 'A valid license is required for backups.'];
+        }
+
         if (! $force) {
             $scheduledDue = $state->backup_enabled && now()->gte($this->scheduledDueAt($state));
             $dailyDue = $this->dailyMinimumApplies($state) && now()->gte($this->dailyDueAt($state));
@@ -178,9 +198,18 @@ class BackupService
             }
         }
 
-        // No point dumping the whole database just to fail the upload.
-        if (! $this->health->isHealthy()) {
-            $result = ['ok' => false, 'message' => 'Skipped: backup provider is unreachable.'];
+        // No point dumping the whole database just to fail the upload: while
+        // the provider is in its back-off window, automatic runs just wait
+        // (nothing is recorded, so the retry happens as soon as it ends);
+        // otherwise the server checks the provider itself right before
+        // dumping. A failed probe starts a 30+ minute back-off.
+        $probe = $this->health->gate('backup', respectBackoff: ! $force);
+        if (! $probe['ok'] && $probe['attempts'] === 0) {
+            // Still inside the back-off window: wait, record nothing.
+            return ['ok' => true, 'skipped' => true, 'message' => $probe['message']];
+        }
+        if (! $probe['ok']) {
+            $result = ['ok' => false, 'message' => 'Skipped: ' . $probe['message']];
             $this->recordResult($state, $result);
 
             return $result;
@@ -242,10 +271,10 @@ class BackupService
         $common = $this->client->identityPayload();
 
         try {
-            $init = Http::acceptJson()->timeout(30)->post($this->client->url('backup/initialize'), $common + [
+            $init = $this->postTwice('backup/initialize', $common + [
                 'file_name' => $fileName,
                 'total_chunks' => $totalChunks,
-            ]);
+            ], 30);
         } catch (ConnectionException $exception) {
             return ['ok' => false, 'message' => 'Unable to reach backup server: ' . $exception->getMessage()];
         }
@@ -318,9 +347,9 @@ class BackupService
         }
 
         try {
-            $complete = Http::acceptJson()->timeout(60)->post($this->client->url('backup/complete'), $common + [
+            $complete = $this->postTwice('backup/complete', $common + [
                 'backup_id' => $backupId,
-            ]);
+            ], 60);
         } catch (ConnectionException $exception) {
             return ['ok' => false, 'message' => 'Unable to reach backup server to complete: ' . $exception->getMessage()];
         }
@@ -331,6 +360,36 @@ class BackupService
         }
 
         return ['ok' => true, 'backup_id' => $backupId, 'message' => 'Backup completed successfully.', 'response' => $completeJson];
+    }
+
+    /**
+     * A backup step POST, tried at least twice on a connection error or 5xx.
+     *
+     * @throws ConnectionException when every attempt failed to connect
+     */
+    private function postTwice(string $endpoint, array $payload, int $timeout): \Illuminate\Http\Client\Response
+    {
+        $attempts = max(2, (int) config('subandl.live_attempts', 2));
+
+        for ($attempt = 1; ; $attempt++) {
+            try {
+                $response = Http::acceptJson()->timeout($timeout)->post($this->client->url($endpoint), $payload);
+
+                if (! $response->serverError() || $attempt >= $attempts) {
+                    return $response;
+                }
+                $reason = 'HTTP ' . $response->status();
+            } catch (ConnectionException $e) {
+                if ($attempt >= $attempts) {
+                    ActivityLog::record('backup', false, "/{$endpoint} failed after {$attempt} attempts: {$e->getMessage()}");
+                    throw $e;
+                }
+                $reason = $e->getMessage();
+            }
+
+            ActivityLog::record('backup', false, "/{$endpoint} attempt {$attempt} failed ({$reason}); retrying.");
+            sleep((int) config('subandl.live_retry_delay_seconds', 2));
+        }
     }
 
     /**

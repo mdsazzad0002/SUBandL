@@ -53,6 +53,7 @@ class InjectWidget
             'auth' => (bool) $request->user(),
             'hiddenOn' => array_values((array) config('subandl.widget.hidden_on', [])),
             'reminderMinutes' => (int) config('subandl.widget.reminder_minutes', 10),
+            'dueReminderHours' => (int) config('subandl.widget.due_reminder_hours', 24),
             'updateSnoozeHours' => (int) config('subandl.widget.update_snooze_hours', 6),
             'edgeTab' => (bool) config('subandl.widget.edge_tab', true),
         ];

@@ -35,9 +35,11 @@ Route::middleware('auth')->group(function () {
     Route::get('/license/backup/history', [C::class, 'backupHistory'])->name('license.backup.history');
 
     Route::post('/license/update/check', [C::class, 'checkUpdate'])->name('license.update.check');
+    Route::post('/license/update/preflight', [C::class, 'updatePreflight'])->name('license.update.preflight');
     Route::post('/license/update/run', [C::class, 'runUpdate'])->name('license.update.run');
     Route::get('/license/update/status', [C::class, 'updateStatus'])->name('license.update.status');
     Route::get('/license/update/history', [C::class, 'updateHistory'])->name('license.update.history');
+    Route::get('/license/activity', [C::class, 'activity'])->name('license.activity');
 
     if (config('subandl.routes.clear_cache', true)) {
         Route::post('/clear-cache', [C::class, 'clearCache'])->name('cache.clear');

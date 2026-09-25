@@ -27,12 +27,15 @@ class UpdateNotice
             'latest_version' => $check['latest_version'] ?? null,
             'changelog' => $check['changelog'] ?? null,
             'force_update' => (bool) ($check['force_update'] ?? false),
+            'version_title' => $check['version_title'] ?? null,
+            'locked' => (bool) ($check['locked'] ?? false),
+            'monthly_fee' => $check['monthly_fee'] ?? null,
             'checked_at' => now()->toDateTimeString(),
         ]);
     }
 
     /**
-     * @return array{available: bool, latest_version: ?string, changelog: mixed, force_update: bool, checked_at: ?string}
+     * @return array{available: bool, latest_version: ?string, changelog: mixed, force_update: bool, version_title: ?string, locked: bool, monthly_fee: mixed, checked_at: ?string}
      */
     public static function get(): array
     {
@@ -47,6 +50,9 @@ class UpdateNotice
             'latest_version' => $available ? $latest : null,
             'changelog' => $available ? ($notice['changelog'] ?? null) : null,
             'force_update' => $available && ($notice['force_update'] ?? false),
+            'version_title' => $available ? ($notice['version_title'] ?? null) : null,
+            'locked' => $available && ($notice['locked'] ?? false),
+            'monthly_fee' => $notice['monthly_fee'] ?? null,
             'checked_at' => $notice['checked_at'] ?? null,
         ];
     }

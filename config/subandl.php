@@ -39,11 +39,42 @@ return [
     // Explicit user actions (Save License, Refresh) always check live.
     'verify_cache_minutes' => (int) env('SUBANDL_VERIFY_CACHE_MINUTES', env('LICENSE_VERIFY_CACHE_MINUTES', 720)),
 
+    // While money is owed, the grace period runs or the license is unusable,
+    // verify this often instead — a payment unlocks within minutes.
+    'verify_cache_minutes_when_due' => 30,
+
+    // After the provider could not be reached from the server, automatic
+    // license/update/backup work waits this long (minimum 30) before retrying.
+    'health_retry_minutes' => 30,
+
+    // Every live call (license, update check, backup, update download) is
+    // preceded by a health ping to /api/ping. The ping and the call itself are
+    // each tried health_attempts / live_attempts times (min 2) before counting
+    // as failed; then the task waits health_retry_minutes and tries again.
+    // Everything is written to the activity log on the Update & Backup page.
+    'health_attempts' => 2,
+    'health_timeout' => 8,
+    'health_retry_delay_seconds' => 3,
+    'live_attempts' => 2,
+    'live_retry_delay_seconds' => 2,
+
+    // Verify the license live, right away, when the site is opened on a
+    // domain or runs on a device (machine + folder) other than the one stored
+    // in the database — instead of waiting for the next scheduled check. A
+    // first visit only stores the baseline. The live call gives up after
+    // identity_check_timeout seconds so a provider outage can't hang a page.
+    'verify_on_identity_change' => true,
+    'identity_check_timeout' => 5,
+
     // Minimum gap between two automatic update checks.
     'update_check_hours' => 2,
 
-    // A backup is due this many hours after the previous attempt.
-    'backup_interval_hours' => 6,
+    // Automatic backups (customer toggle on) run this many hours apart; never
+    // closer than backup_min_interval_hours. With the toggle off, one backup a
+    // day still goes out (backup_daily_minimum). Both are triggered by any
+    // page visit, so no system cron is required.
+    'backup_interval_hours' => 8,
+    'backup_min_interval_hours' => 8,
 
     // A running backup/update flag older than this is treated as a dead run.
     'stale_minutes' => 30,
@@ -79,7 +110,12 @@ return [
         'hidden_on' => ['login', 'register', 'password/*', 'subscription', 'subscription/*', 'license/*', 'terms'],
 
         // "Remind me later" on the payment reminder hides it for this long.
+        // Payment reminder popup: every reminder_minutes once payment is late
+        // (grace period running) — "Later" only hides it that long, and a
+        // banner stays on screen until it is paid. Before the due date it
+        // pops up every due_reminder_hours instead.
         'reminder_minutes' => 10,
+        'due_reminder_hours' => 24,
 
         // "Later" on the update modal hides it for this long (per version).
         'update_snooze_hours' => 6,
@@ -98,6 +134,7 @@ return [
         'installations' => 'license_installations',
         'backup_histories' => 'backup_histories',
         'update_histories' => 'update_histories',
+        'activity_logs' => 'license_activity_logs',
     ],
 
     /*
