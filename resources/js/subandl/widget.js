@@ -153,6 +153,7 @@ const icons = {
     check: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>',
     shield: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>',
     close: '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>',
+    refresh: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 4v6h-6"/></svg>',
 };
 
 const root = document.createElement('div');
@@ -303,7 +304,13 @@ function renderUpdate(u) {
     return `
         <section class="sbw-card">
             <h3>Software version</h3>
-            <p class="sbw-kv"><span>Installed</span><strong>v${esc(state.version)}</strong></p>
+            <p class="sbw-kv">
+                <span>Installed</span>
+                <span class="sbw-version-row">
+                    ${!(u.available && !u.running) ? `<button type="button" class="sbw-icon sbw-version-sync" data-sbw="check-update" title="Check for update" aria-label="Check for update" ${actionOff()}>${icons.refresh}</button>` : ''}
+                    <strong>v${esc(state.version)}</strong>
+                </span>
+            </p>
             <p class="sbw-kv"><span>Status</span>${badge}</p>
             ${u.updates_included === false ? `<p class="sbw-note sbw-bad">Your lifetime license keeps working. New versions need the monthly update subscription${u.monthly_fee ? ` (${money(u.monthly_fee)} ${esc(u.currency)}/month)` : ''}.</p>` : ''}
             ${u.retry_at
@@ -311,11 +318,11 @@ function renderUpdate(u) {
                 : u.health ? `<p class="sbw-kv"><span>Provider server</span><span class="sbw-badge sbw-${u.health.ok ? 'ok' : 'bad'}">${u.health.ok ? 'Reachable' : 'Unreachable'} · ${ago(u.health.at)}</span></p>` : ''}
             <p class="sbw-muted">Last checked: ${u.checked_at ? ago(u.checked_at) : 'not yet'}</p>
             ${lastResult}
-            <div class="sbw-actions">
-                ${u.available && !u.running
-                    ? `<button type="button" class="sbw-btn" data-sbw="update-modal" ${actionOff()}>${u.locked ? 'See what’s new' : `Update to v${esc(u.latest_version)}`}</button>`
-                    : `<button type="button" class="sbw-btn sbw-ghost" data-sbw="check-update" ${actionOff()}>Check for update</button>`}
-            </div>
+            ${u.available && !u.running
+                ? `<div class="sbw-actions">
+                    <button type="button" class="sbw-btn" data-sbw="update-modal" ${actionOff()}>${u.locked ? 'See what’s new' : `Update to v${esc(u.latest_version)}`}</button>
+                </div>`
+                : ''}
             ${unlicensedNote()}
         </section>`;
 }

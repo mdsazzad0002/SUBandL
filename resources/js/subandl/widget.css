@@ -93,6 +93,8 @@ html.sbw-noscroll, html.sbw-noscroll body { overflow: hidden !important; }
 .sbw-kv { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .sbw-kv > span:first-child { color: var(--sbw-muted); }
 .sbw-kv small { color: var(--sbw-muted); font-weight: 400; }
+.sbw-version-row { display: flex; align-items: center; gap: 6px; }
+.sbw-version-sync { padding: 4px; }
 .sbw-box { margin: 8px 0; padding: 10px 12px; border-radius: 10px; background: var(--sbw-soft); }
 .sbw-box .sbw-label { margin-bottom: 4px; }
 .sbw-box p { margin: 0 0 2px; }
