@@ -29,9 +29,18 @@ class CliPhpBinary
         }
 
         // LiteSpeed/CyberPanel: PHP_BINARY is .../lsphpXY/bin/lsphp and the CLI
-        // binary sits next to it; other builds ship an unversioned bin/php.
-        $lsphp = '/usr/local/lsws/lsphp' . PHP_MAJOR_VERSION . PHP_MINOR_VERSION . '/bin/php';
-        foreach ([dirname(PHP_BINARY) . '/php', $lsphp, rtrim(PHP_BINDIR, '/') . '/php'] as $path) {
+        // binary sits next to it; cPanel, CloudLinux and Plesk keep one CLI per
+        // version under their own prefix; other builds ship an unversioned bin/php.
+        [$major, $minor] = [PHP_MAJOR_VERSION, PHP_MINOR_VERSION];
+        $candidates = [
+            dirname(PHP_BINARY) . '/php',
+            "/usr/local/lsws/lsphp{$major}{$minor}/bin/php",
+            "/opt/cpanel/ea-php{$major}{$minor}/root/usr/bin/php",
+            "/opt/alt/php{$major}{$minor}/usr/bin/php",
+            "/opt/plesk/php/{$major}.{$minor}/bin/php",
+            rtrim(PHP_BINDIR, '/') . '/php',
+        ];
+        foreach ($candidates as $path) {
             if (is_executable($path)) {
                 return $path;
             }
