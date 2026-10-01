@@ -28,6 +28,15 @@ class CliPhpBinary
             }
         }
 
+        // LiteSpeed/CyberPanel: PHP_BINARY is .../lsphpXY/bin/lsphp and the CLI
+        // binary sits next to it; other builds ship an unversioned bin/php.
+        $lsphp = '/usr/local/lsws/lsphp' . PHP_MAJOR_VERSION . PHP_MINOR_VERSION . '/bin/php';
+        foreach ([dirname(PHP_BINARY) . '/php', $lsphp, rtrim(PHP_BINDIR, '/') . '/php'] as $path) {
+            if (is_executable($path)) {
+                return $path;
+            }
+        }
+
         return $versioned;
     }
 }

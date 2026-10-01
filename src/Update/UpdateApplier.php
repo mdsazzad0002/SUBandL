@@ -6,6 +6,7 @@ use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Http;
 use SUBandL\Backup\BackupService;
 use SUBandL\Events\UpdateFinished;
+use SUBandL\Models\ActivityLog;
 use SUBandL\Models\LicenseState;
 use SUBandL\Models\UpdateHistory;
 use SUBandL\Support\CliPhpBinary;
@@ -91,6 +92,17 @@ class UpdateApplier
             'to_version' => $toVersion,
             'message' => $ok ? "Applied update to v{$toVersion}." : ($result['message'] ?? 'Update failed.'),
         ]);
+
+        if (! $ok) {
+            // The full console output (the message only carries the extracted
+            // reason) — shown in the activity log and written to laravel.log.
+            $output = trim(($result['migration_output'] ?? '') . "\n" . ($result['commands_output'] ?? ''));
+            ActivityLog::record('update', false, $result['message'] ?? 'Update failed.', array_filter([
+                'from_version' => $fromVersion,
+                'to_version' => $toVersion,
+                'output' => $output !== '' ? mb_substr($output, -8000) : null,
+            ]));
+        }
 
         if ($ok) {
             UpdateNotice::clear();
@@ -194,6 +206,7 @@ class UpdateApplier
                 'extracted' => true,
                 'message' => 'Update files applied but migrations failed: ' . $migrationResult['message'],
                 'backup_path' => $backupId,
+                'migration_output' => $migrationResult['output'],
             ];
         }
 
@@ -397,7 +410,11 @@ class UpdateApplier
             $output .= "\$ php artisan {$command}\n" . $commandOutput . "\n";
 
             if (! $ok) {
-                return ['ok' => false, 'message' => "Command failed: {$command}", 'output' => $output];
+                return [
+                    'ok' => false,
+                    'message' => "Command failed: {$command} — " . self::failureReason($commandOutput),
+                    'output' => $output,
+                ];
             }
         }
 
@@ -409,27 +426,90 @@ class UpdateApplier
      */
     private function runArtisan(string $command): array
     {
+        $binary = CliPhpBinary::resolve();
         $process = Process::fromShellCommandline(
-            escapeshellarg(CliPhpBinary::resolve()) . ' ' . escapeshellarg(base_path('artisan')) . ' ' . $command,
+            escapeshellarg($binary) . ' ' . escapeshellarg(base_path('artisan')) . ' ' . $command,
             base_path()
         );
         $process->setTimeout(600);
 
         try {
             $process->run();
+            $output = $process->getOutput() . $process->getErrorOutput();
 
-            return [$process->isSuccessful(), $process->getOutput() . $process->getErrorOutput()];
+            // 126/127: the php binary is missing or not executable on this host
+            // (common under LiteSpeed/CyberPanel) — run in-process instead of
+            // failing the update over a path lookup.
+            if (! in_array($process->getExitCode(), [126, 127], true)) {
+                return [
+                    $process->isSuccessful(),
+                    $process->isSuccessful() ? $output : $output . "\n[exit code {$process->getExitCode()}]",
+                ];
+            }
+
+            $prefix = "[{$binary} unusable (exit {$process->getExitCode()}): " . trim($output) . "; ran in-process]\n";
         } catch (\Symfony\Component\Process\Exception\RuntimeException $e) {
             // proc_open disabled on the host (not a timeout) — fall back to in-process.
             if ($e instanceof \Symfony\Component\Process\Exception\ProcessTimedOutException) {
                 return [false, $process->getOutput() . $process->getErrorOutput() . "\nTimed out."];
             }
+
+            $prefix = "[subprocess unavailable: {$e->getMessage()}; ran in-process]\n";
         }
 
         try {
-            return [Artisan::call($command) === 0, Artisan::output()];
+            return [Artisan::call($command) === 0, $prefix . Artisan::output()];
         } catch (\Throwable $e) {
-            return [false, $e->getMessage()];
+            return [false, $prefix . get_class($e) . ': ' . $e->getMessage()];
         }
+    }
+
+    /**
+     * Pulls the line that explains a failed artisan run out of its console
+     * output — the failing migration plus the SQL/exception message — so the
+     * update UI and history say why, not just "Command failed".
+     */
+    public static function failureReason(string $output): string
+    {
+        $text = preg_replace('/\e\[[0-9;]*[A-Za-z]/', '', $output);
+        $all = array_values(array_filter(array_map('trim', preg_split('/\R/', $text)), 'strlen'));
+
+        // The runner's own "[exit code N]" / "[... ran in-process]" notes are
+        // only the reason when the command printed nothing else.
+        $isNote = fn ($line) => (bool) preg_match('/^\[(exit code \d+|.*ran in-process)\]$/', $line);
+        $notes = array_values(array_filter($all, $isNote));
+        $lines = array_values(array_filter($all, fn ($line) => ! $isNote($line)));
+
+        $migration = null;
+        foreach ($lines as $line) {
+            if (preg_match('/^(\d{4}_\d{2}_\d{2}_\d{6}_\w+)\s.*\bFAIL\b/', $line, $m)) {
+                $migration = $m[1];
+            }
+        }
+
+        $reason = null;
+        foreach ($lines as $line) {
+            if (preg_match('/SQLSTATE\[|^[\w\\\\]*(Exception|Error):|^(PHP )?(Fatal|Parse) error|not found|Permission denied|unusable|Timed out/i', $line)
+                && ! preg_match('/^(#\d+|at |\d+\s*▕|\+\d+ vendor frames)/u', $line)) {
+                $reason = $line;
+                break;
+            }
+        }
+
+        // Laravel's console renderer prints the exception class on its own
+        // line and the message on the next one.
+        if ($reason === null) {
+            foreach ($lines as $i => $line) {
+                if (preg_match('/^[A-Z][\w\\\\]+(Exception|Error)$/', $line) && isset($lines[$i + 1])) {
+                    $reason = $line . ': ' . $lines[$i + 1];
+                    break;
+                }
+            }
+        }
+
+        $reason ??= end($lines) ?: (end($notes) ?: 'no output');
+        $reason = mb_strimwidth($reason, 0, 600, '…');
+
+        return $migration ? "{$migration}: {$reason}" : $reason;
     }
 }
