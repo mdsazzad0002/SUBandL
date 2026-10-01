@@ -438,9 +438,13 @@ class UpdateApplier
             $output = $process->getOutput() . $process->getErrorOutput();
 
             // 126/127: the php binary is missing or not executable on this host
-            // (common under LiteSpeed/CyberPanel) — run in-process instead of
-            // failing the update over a path lookup.
-            if (! in_array($process->getExitCode(), [126, 127], true)) {
+            // (common under LiteSpeed/CyberPanel); or it is a different PHP
+            // version that Composer's platform check rejects — run in-process
+            // instead of failing the update over a path lookup.
+            $wrongBinary = in_array($process->getExitCode(), [126, 127], true)
+                || str_contains($output, 'Your Composer dependencies require a PHP version');
+
+            if (! $wrongBinary) {
                 return [
                     $process->isSuccessful(),
                     $process->isSuccessful() ? $output : $output . "\n[exit code {$process->getExitCode()}]",

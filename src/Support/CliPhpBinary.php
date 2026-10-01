@@ -28,24 +28,40 @@ class CliPhpBinary
             }
         }
 
-        // LiteSpeed/CyberPanel: PHP_BINARY is .../lsphpXY/bin/lsphp and the CLI
-        // binary sits next to it; cPanel, CloudLinux and Plesk keep one CLI per
-        // version under their own prefix; other builds ship an unversioned bin/php.
+        // LiteSpeed/CyberPanel, cPanel, CloudLinux and Plesk keep one CLI per
+        // PHP version under their own prefix.
         [$major, $minor] = [PHP_MAJOR_VERSION, PHP_MINOR_VERSION];
-        $candidates = [
-            dirname(PHP_BINARY) . '/php',
+        foreach ([
             "/usr/local/lsws/lsphp{$major}{$minor}/bin/php",
             "/opt/cpanel/ea-php{$major}{$minor}/root/usr/bin/php",
             "/opt/alt/php{$major}{$minor}/usr/bin/php",
             "/opt/plesk/php/{$major}.{$minor}/bin/php",
-            rtrim(PHP_BINDIR, '/') . '/php',
-        ];
-        foreach ($candidates as $path) {
+        ] as $path) {
             if (is_executable($path)) {
                 return $path;
             }
         }
 
+        // An unversioned `php` is often the host's old system default (e.g. 7.3
+        // while the site runs 8.3) — only use one that reports this version.
+        foreach ([dirname(PHP_BINARY) . '/php', rtrim(PHP_BINDIR, '/') . '/php', '/usr/bin/php', '/usr/local/bin/php'] as $path) {
+            if (self::reportsThisVersion($path)) {
+                return $path;
+            }
+        }
+
         return $versioned;
+    }
+
+    private static function reportsThisVersion(string $path): bool
+    {
+        if (! is_executable($path) || ! function_exists('exec')) {
+            return false;
+        }
+
+        $output = [];
+        @exec(escapeshellarg($path) . ' -r ' . escapeshellarg('echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;') . ' 2>/dev/null', $output, $exit);
+
+        return $exit === 0 && trim(implode('', $output)) === PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION;
     }
 }
