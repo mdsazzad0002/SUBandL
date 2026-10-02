@@ -113,10 +113,10 @@ class WidgetController extends Controller
         }
 
         return [
-            // What to pay now = previous unpaid balance + this period's fee.
+            // Total to pay now; fee_due + other_due add up to it.
             'due_amount' => $due,
-            'previous_due' => $state->previousDue(),
-            'current_fee_due' => $state->currentFeeDue(),
+            'fee_due' => $state->feeDue(),
+            'other_due' => $state->otherDue(),
             'monthly_fee' => $state->monthly_fee,
             'currency' => $billing['currency'] ?? ($state->payment_info['currency'] ?? 'BDT'),
             'payment_info' => $state->payment_info,

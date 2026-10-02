@@ -138,32 +138,40 @@ class LicenseState extends Model
         return (bool) ($this->billing()['payment_late'] ?? $this->in_grace_period);
     }
 
-    /** Earlier unpaid balance (the provider's due_amount). */
-    public function previousDue(): float
+    /**
+     * Everything unpaid, as the provider reports it: due_amount sums ALL open
+     * invoices — the subscription fees (fee_due_amount) included. A late
+     * payment with nothing invoiced yet still owes this period's fee, so the
+     * monthly fee stands in for it rather than showing 0.
+     */
+    public function totalDue(): float
     {
-        return (float) ($this->billing()['due_amount'] ?? $this->due_amount ?? 0);
+        $total = (float) ($this->billing()['due_amount'] ?? $this->due_amount ?? 0);
+
+        return $total > 0 ? $total : $this->unbilledFee();
     }
 
-    /**
-     * The subscription fee owed for the current period (the provider's
-     * fee_due_amount). A late payment with nothing itemised still owes this
-     * period's fee, so the monthly fee stands in for it.
-     */
-    public function currentFeeDue(): float
+    /** The subscription-fee part of totalDue() (current and older unpaid fees). */
+    public function feeDue(): float
     {
         $fee = (float) ($this->billing()['fee_due_amount'] ?? 0);
 
-        if ($fee <= 0 && $this->previousDue() <= 0 && $this->isPaymentLate()) {
-            $fee = (float) ($this->billing()['monthly_fee'] ?? $this->monthly_fee ?? 0);
-        }
-
-        return $fee;
+        return $fee > 0 ? $fee : $this->unbilledFee();
     }
 
-    /** Previous due + this period's fee: what the client has to pay now. */
-    public function totalDue(): float
+    /** Other unpaid invoices (installation, extras): totalDue() minus the fees. */
+    public function otherDue(): float
     {
-        return $this->previousDue() + $this->currentFeeDue();
+        return max(0.0, round($this->totalDue() - $this->feeDue(), 2));
+    }
+
+    private function unbilledFee(): float
+    {
+        if ((float) ($this->billing()['due_amount'] ?? $this->due_amount ?? 0) > 0 || ! $this->isPaymentLate()) {
+            return 0.0;
+        }
+
+        return (float) ($this->billing()['monthly_fee'] ?? $this->monthly_fee ?? 0);
     }
 
     /** Money is owed, grace is running, or the license is unusable. */

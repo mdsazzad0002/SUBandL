@@ -242,12 +242,14 @@ function renderInvoices(p) {
         </div>`).join('')}</div>`;
 }
 
-// Previous due + this period's fee, each shown only when owed.
+// The total's parts — subscription fee and other dues — each only when owed.
 function renderDueBreakdown(p) {
     const row = (label, value) => Number(value) > 0
         ? `<p class="sbw-kv"><span>${label}</span><strong>${money(value)} ${esc(p.currency)}</strong></p>`
         : '';
-    return row('Previous due', p.previous_due) + row('Current subscription fee', p.current_fee_due);
+    // A single part equal to the total adds nothing.
+    if (!(Number(p.other_due) > 0)) return '';
+    return row('Subscription fee', p.fee_due) + row('Other dues', p.other_due);
 }
 
 function renderPayment(p) {
