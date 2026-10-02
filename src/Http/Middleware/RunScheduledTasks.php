@@ -11,7 +11,8 @@ use SUBandL\Support\BackgroundArtisan;
  * Poor-man's cron: fires the license, update and backup checks from
  * web traffic (page visits), as detached processes, so they happen even on
  * hosts with no system cron. These TTLs are only how often a spawn is
- * attempted — every command self-throttles its real provider work.
+ * attempted — every command self-throttles its real provider work. Nothing
+ * is spawned on the visit that starts the clock, only once a TTL has passed.
  */
 class RunScheduledTasks
 {
@@ -23,9 +24,6 @@ class RunScheduledTasks
 
     public function handle(Request $request, Closure $next)
     {
-        // Any page visit counts (signed in or not): the daily backup must go
-        // out as soon as someone opens the site. Each spawn is throttled here
-        // and every command also throttles itself.
         if (! config('subandl.middleware.web_scheduler', true)
             || ! $request->isMethod('GET')
             || $request->routeIs('subandl.asset')) {
@@ -33,7 +31,20 @@ class RunScheduledTasks
         }
 
         foreach (self::CHECKS as $command => $ttlSeconds) {
-            if (Cache::add("subandl:scheduler:{$command}", true, $ttlSeconds)) {
+            $key = "subandl:scheduler:{$command}:due";
+            $due = Cache::get($key);
+
+            // Never on arrival: a first visit (fresh install, cleared cache, just
+            // updated) only starts the clock, so opening the site never sets off
+            // license/update/backup work at once — it runs on a later visit.
+            if (! is_int($due)) {
+                Cache::add($key, time() + $ttlSeconds);
+
+                continue;
+            }
+
+            if ($due <= time() && Cache::add("subandl:scheduler:{$command}:claim", true, 60)) {
+                Cache::forever($key, time() + $ttlSeconds);
                 BackgroundArtisan::dispatch($command);
             }
         }

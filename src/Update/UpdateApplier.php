@@ -272,26 +272,23 @@ class UpdateApplier
 
         for ($i = 0; $i < $zip->numFiles; $i++) {
             $entryPath = $zip->getNameIndex($i);
-            if ($entryPath === false || $this->safeRelativePath($entryPath) === null) {
+            $relative = $entryPath === false ? null : $this->safeRelativePath($entryPath);
+            if ($relative === null) {
                 continue;
             }
 
-            // extractTo() signals failure (permission denied, disk full, CRC mismatch)
-            // either as a plain `false` or — since Laravel converts warnings — as an
-            // ErrorException; both must be handled.
-            $extractError = null;
-
+            // Laravel turns warnings into ErrorException; both that and a
+            // plain failure end the extraction with the entry named.
             try {
-                $ok = $zip->extractTo($destination, $entryPath);
+                $error = $this->extractEntry($zip, $i, $entryPath, rtrim($destination, '/\\') . '/' . $relative);
             } catch (\ErrorException $e) {
-                $ok = false;
-                $extractError = $e->getMessage();
+                $error = $e->getMessage();
             }
 
-            if (! $ok) {
+            if ($error !== null) {
                 return [
                     'ok' => false,
-                    'message' => "failed to extract '{$entryPath}' (" . ($extractError ?? $zip->getStatusString() ?: 'unknown error') . ')',
+                    'message' => "failed to extract '{$entryPath}' ({$error})",
                     'extracted' => $extracted,
                 ];
             }
@@ -300,6 +297,74 @@ class UpdateApplier
         }
 
         return ['ok' => true, 'extracted' => $extracted];
+    }
+
+    /**
+     * Writes one entry without ZipArchive::extractTo(): that call also sets the
+     * file's mtime, which only the file's OWNER may do — so a file uploaded by
+     * another account (FTP, a deploy user) failed with "Operation not permitted"
+     * even though it was writable. Instead the entry goes to a temp file next to
+     * the target and is renamed over it, which only needs the folder to be
+     * writable (and swaps the file atomically); failing that, the existing file
+     * is overwritten in place.
+     *
+     * @return string|null the error, or null on success
+     */
+    private function extractEntry(ZipArchive $zip, int $index, string $entryPath, string $target): ?string
+    {
+        if (str_ends_with($entryPath, '/')) {
+            return is_dir($target) || @mkdir($target, 0755, true) ? null : 'could not create directory';
+        }
+
+        $dir = dirname($target);
+        if (! is_dir($dir) && ! @mkdir($dir, 0755, true) && ! is_dir($dir)) {
+            return "could not create directory '{$dir}'";
+        }
+
+        $expected = $zip->statIndex($index)['size'] ?? null;
+        $input = $zip->getStream($entryPath);
+        if ($input === false) {
+            return $zip->getStatusString() ?: 'could not read the entry';
+        }
+
+        $temp = $dir . '/.subandl-' . bin2hex(random_bytes(6)) . '.tmp';
+        $output = @fopen($temp, 'wb');
+
+        if ($output === false) {
+            // The folder itself is not writable: overwrite the file in place.
+            $contents = stream_get_contents($input);
+            fclose($input);
+
+            if ($contents === false || ($expected !== null && strlen($contents) !== $expected)) {
+                return 'the archive entry is corrupt';
+            }
+
+            return @file_put_contents($target, $contents) === strlen($contents)
+                ? null
+                : (error_get_last()['message'] ?? 'permission denied');
+        }
+
+        $written = stream_copy_to_stream($input, $output);
+        fclose($input);
+        fclose($output);
+
+        if ($written === false || ($expected !== null && $written !== $expected)) {
+            @unlink($temp);
+
+            return 'the archive entry is corrupt';
+        }
+
+        @chmod($temp, is_file($target) ? (fileperms($target) & 0777) : 0644);
+
+        if (@rename($temp, $target)) {
+            return null;
+        }
+
+        // Rename refused (sticky folder, target is a directory…): overwrite in place.
+        $ok = @copy($temp, $target);
+        @unlink($temp);
+
+        return $ok ? null : (error_get_last()['message'] ?? 'permission denied');
     }
 
     /**
