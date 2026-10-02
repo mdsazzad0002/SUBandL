@@ -66,6 +66,14 @@ return [
     'verify_on_identity_change' => true,
     'identity_check_timeout' => 5,
 
+    // POST /subandl/webhook: the provider calls it right after a payment, due
+    // or block changes, and the app re-verifies the license at once. Signed
+    // with the license key; throttled to one re-check per throttle_seconds.
+    'webhook' => [
+        'enabled' => true,
+        'throttle_seconds' => 10,
+    ],
+
     // Minimum gap between two automatic update checks.
     'update_check_hours' => 2,
 

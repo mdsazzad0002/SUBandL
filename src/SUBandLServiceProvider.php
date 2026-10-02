@@ -7,9 +7,11 @@ use Illuminate\Contracts\Http\Kernel as HttpKernel;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\ServiceProvider;
 use SUBandL\Contracts\AccessResolver;
+use SUBandL\Http\Controllers\WebhookController;
 use SUBandL\Http\Middleware\EnsureLicenseValid;
 use SUBandL\Http\Middleware\InjectWidget;
 use SUBandL\Http\Middleware\RunScheduledTasks;
+
 
 class SUBandLServiceProvider extends ServiceProvider
 {
@@ -73,6 +75,15 @@ class SUBandLServiceProvider extends ServiceProvider
         Route::middleware((array) config('subandl.routes.middleware', ['web']))
             ->prefix((string) config('subandl.routes.prefix', ''))
             ->group(__DIR__ . '/../routes/subandl.php');
+
+        // Server-to-server call from the provider: outside the web group, so
+        // no session, CSRF or license redirect gets in its way. It is signed
+        // with the license key (see WebhookController).
+        if (config('subandl.webhook.enabled', true)) {
+            Route::prefix((string) config('subandl.routes.prefix', ''))
+                ->post('/subandl/webhook', [WebhookController::class, 'handle'])
+                ->name('subandl.webhook');
+        }
     }
 
     private function registerMiddleware(): void

@@ -136,6 +136,17 @@ Every step is written to the **activity log** (`license_activity_logs`), which a
 
 The known device (machine + install folder) and domain are stored in the database (`license_installations.fingerprint` / `domain`). When a request comes from a different device or domain, the license is re-verified live right then (`verify_on_identity_change`). A copied install is caught on its first page load, and a legitimate move is confirmed just as fast. A first visit, a fresh install or an upgrade only records the baseline, without contacting the provider. The live call gives up after `identity_check_timeout` seconds (5); while the provider is down the page carries on with the stored state, and the check is retried after the health back-off. Background checks send the stored domain, so the provider's domain binding applies to them too. IP addresses and `localhost` never count as a domain.
 
+### Instant refresh from the portal (webhook)
+
+`POST /subandl/webhook` lets the portal say "the license changed — check now"
+right after a payment, a due or a block. The app then re-verifies live, so the
+change shows at once instead of at the next scheduled check. The request carries
+no license data, only a signature: `X-SUBandL-Timestamp` and
+`X-SUBandL-Signature` = HMAC-SHA256 of `"{timestamp}.{body}"` keyed with the
+license key (max 5 minutes old). Re-checks are throttled to one per
+`webhook.throttle_seconds`. The route sits outside the `web` group (no session,
+CSRF or license redirect). Turn it off with `webhook.enabled = false`.
+
 ### Daily backup guarantee
 
 Automatic backups (customer toggle on) run every `backup_interval_hours` (8, never less than `backup_min_interval_hours`). With `backup_daily_minimum` on (the default), a backup also runs whenever there has been no **successful** backup in the last 24 hours, even when the customer's automatic backup toggle is off. After a failure it retries every `backup_daily_retry_minutes`. It needs a usable license, and it runs from the scheduler, the web scheduler and the widget, so it works without a system cron.
