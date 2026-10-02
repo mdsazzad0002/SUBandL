@@ -35,9 +35,9 @@ return [
     'http_timeout' => 15,
 
     // How long a cached verification is trusted before an automatic
-    // (non-forced) refresh attempts another live check. 720 = 2 checks/day.
+    // (non-forced) refresh attempts another live check. 2880 = once every 2 days.
     // Explicit user actions (Save License, Refresh) always check live.
-    'verify_cache_minutes' => (int) env('SUBANDL_VERIFY_CACHE_MINUTES', env('LICENSE_VERIFY_CACHE_MINUTES', 720)),
+    'verify_cache_minutes' => (int) env('SUBANDL_VERIFY_CACHE_MINUTES', env('LICENSE_VERIFY_CACHE_MINUTES', 2880)),
 
     // While money is owed, the grace period runs or the license is unusable,
     // verify this often instead — a payment unlocks within minutes.

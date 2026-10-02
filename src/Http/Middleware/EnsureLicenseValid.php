@@ -24,7 +24,7 @@ class EnsureLicenseValid
             return $next($request);
         }
 
-        $this->verifyOnIdentityChange($request);
+        $this->verifyLiveWhenNeeded($request);
 
         // The widget's static files and its state endpoint — a blocked client
         // must still see what to pay. A published config's allowed_when_invalid
@@ -62,20 +62,29 @@ class EnsureLicenseValid
     }
 
     /**
-     * The one exception to "page loads never contact the provider": when the
-     * site is opened on a domain, or runs on a device, other than the one in
-     * the database, the license is verified live right now, so a copied or
-     * moved install is caught (or a legitimate move confirmed) immediately.
-     * A first visit only records the baseline — no live call. The call uses a
-     * short timeout; if the provider is down the page carries on with the
-     * stored state and the check is retried after the health back-off.
+     * The exceptions to "page loads never contact the provider", each verified
+     * live right now:
+     *  - the site is opened on a domain, or runs on a device, other than the one
+     *    in the database, so a copied or moved install is caught (or a legitimate
+     *    move confirmed) immediately. A first visit only records the baseline.
+     *  - the license has never had a verdict (unverified), so a fresh install
+     *    learns whether its license exists on the first open instead of waiting
+     *    for the scheduler.
+     * The call uses a short timeout; if the provider is down the page carries on
+     * with the stored state and the check is retried after the health back-off.
      */
-    private function verifyOnIdentityChange(Request $request): void
+    private function verifyLiveWhenNeeded(Request $request): void
     {
-        if (! config('subandl.verify_on_identity_change', true)
-            || $request->routeIs('subandl.asset')
-            || ! app(IdentityWatch::class)->changed($request)
-            || app(ServerHealth::class)->backoffUntil()) {
+        if ($request->routeIs('subandl.asset') || app(ServerHealth::class)->backoffUntil()) {
+            return;
+        }
+
+        $state = LicenseState::current();
+        $unverified = $state->status === 'unverified' && filled($state->license_key);
+        $identityChanged = config('subandl.verify_on_identity_change', true)
+            && app(IdentityWatch::class)->changed($request);
+
+        if (! $unverified && ! $identityChanged) {
             return;
         }
 
@@ -93,11 +102,13 @@ class EnsureLicenseValid
             'subandl.http_timeout' => $timeout,
             'subandl.health_timeout' => config('subandl.health_timeout', 8),
             'subandl.health_retry_delay_seconds' => config('subandl.health_retry_delay_seconds', 3),
+            'subandl.live_retry_delay_seconds' => config('subandl.live_retry_delay_seconds', 2),
         ];
         config([
             'subandl.http_timeout' => min((int) $timeout, $short),
             'subandl.health_timeout' => min(3, $short),
             'subandl.health_retry_delay_seconds' => 1,
+            'subandl.live_retry_delay_seconds' => 1,
         ]);
 
         try {

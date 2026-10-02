@@ -19,7 +19,7 @@ class LicenseClient
     {
         try {
             $response = $this->send('verify-license', $this->identityPayload(), 'license');
-        } catch (ConnectionException $exception) {
+        } catch (\Throwable $exception) {
             // Distinct from a genuine "invalid" verdict — LicenseVerifier checks for
             // this status so a network hiccup never overwrites a valid cached state.
             return [
@@ -29,26 +29,18 @@ class LicenseClient
             ];
         }
 
-        $json = $response->json() ?? [];
+        $json = $response->json();
 
-        // The provider returns 403/404 with a JSON body for known failure reasons
-        // (invalid, expired, device mismatch) — those are verdicts to parse, not
-        // transport failures.
-        if ($json === [] && ! $response->successful()) {
-            // A 5xx with no JSON body is the host being down (a proxy's 502/503/504
-            // page), never an 'invalid' verdict.
-            if ($response->serverError()) {
-                return [
-                    'ok' => false,
-                    'status' => 'unreachable',
-                    'message' => 'License server unavailable (HTTP ' . $response->status() . ').',
-                ];
-            }
-
+        // Only the provider's own JSON answer is a verdict. Anything else — a 5xx,
+        // a proxy/CDN error page, a rate limit, a parked or expired domain serving
+        // HTML with 200 — means the license API was not reached, however long that
+        // lasts, and must never lock the app. The provider's known failures
+        // (invalid, expired, device mismatch) come as 403/404 WITH such a body.
+        if (! is_array($json) || (! array_key_exists('status', $json) && ! array_key_exists('license_valid', $json))) {
             return [
                 'ok' => false,
-                'status' => 'invalid',
-                'message' => 'License server returned an error (HTTP ' . $response->status() . ').',
+                'status' => 'unreachable',
+                'message' => 'License server gave no license answer (HTTP ' . $response->status() . ').',
             ];
         }
 

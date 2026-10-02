@@ -33,7 +33,7 @@ class LicenseVerifier
             // often, so a payment unlocks (and a lapse locks) within minutes.
             $minInterval = $state->needsAttention()
                 ? (int) config('subandl.verify_cache_minutes_when_due', 30)
-                : (int) config('subandl.verify_cache_minutes', 720);
+                : (int) config('subandl.verify_cache_minutes', 2880);
             if ($state->last_verified_at && $state->last_verified_at->gt(now()->subMinutes($minInterval))) {
                 return $state;
             }
@@ -50,7 +50,12 @@ class LicenseVerifier
             return $state;
         }
 
-        $result = $this->client->verify();
+        try {
+            $result = $this->client->verify();
+        } catch (\Throwable $e) {
+            report($e);
+            $result = ['ok' => false, 'status' => 'unreachable'];
+        }
 
         // A network hiccup or provider outage must never block the app or overwrite a
         // previously-valid cached state — only a genuine verdict from the provider should.

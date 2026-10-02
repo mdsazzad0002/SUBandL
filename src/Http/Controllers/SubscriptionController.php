@@ -512,7 +512,7 @@ class SubscriptionController extends Controller
             'last_backup_status' => $state->last_backup_status,
             'last_backup_message' => $state->last_backup_message,
             'message' => $state->last_verification_error,
-            'next_check_at' => $this->nextDueAt($state->last_verified_at, $state->needsAttention() ? (int) config('subandl.verify_cache_minutes_when_due', 30) : (int) config('subandl.verify_cache_minutes', 720))->toDateTimeString(),
+            'next_check_at' => $this->nextDueAt($state->last_verified_at, $state->needsAttention() ? (int) config('subandl.verify_cache_minutes_when_due', 30) : (int) config('subandl.verify_cache_minutes', 2880))->toDateTimeString(),
             'next_update_check_at' => $this->nextDueAt($state->last_update_check_at, (int) config('subandl.update_check_hours', 2) * 60)->toDateTimeString(),
             'next_backup_at' => $backups->nextDueAt($state)->toDateTimeString(),
         ];
