@@ -202,6 +202,7 @@ html.sbw-noscroll, html.sbw-noscroll body { overflow: hidden !important; }
 .sbw-invoice { display: flex; justify-content: space-between; gap: 12px; padding: 8px 12px; border: 1px solid var(--sbw-line); border-radius: 10px; background: var(--sbw-bg); }
 .sbw-invoice > div { display: flex; flex-direction: column; }
 .sbw-invoice-amt { align-items: flex-end; text-align: end; }
+.sbw-invoice-reason { font-size: 12.5px; color: var(--sbw-text); }
 
 /* Late-payment banner: stays until paid */
 .sbw-banner {

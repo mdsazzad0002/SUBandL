@@ -227,13 +227,17 @@ function paymentHeadline(p) {
     return p.next_due_date ? `Your next payment is due on ${date(p.next_due_date)}.` : 'A payment is due.';
 }
 
+// Each unpaid invoice with what it is for: `reason` comes from the provider
+// (its line items, e.g. "Installation + Monthly Subscription Fee"); older
+// providers send none, so the invoice type stands in.
 function renderInvoices(p) {
     if (!p.invoices?.length) return '';
     return `<div class="sbw-invoices">${p.invoices.map((inv) => `
         <div class="sbw-invoice">
             <div>
                 <strong>${esc(inv.invoice_no || 'Invoice')}</strong>
-                <span class="sbw-muted">${inv.period_start ? `${date(inv.period_start)} – ${date(inv.period_end)}` : esc(fmt(inv.type))}</span>
+                <span class="sbw-invoice-reason">${esc(inv.reason || fmt(inv.type))}</span>
+                ${inv.period_start ? `<span class="sbw-muted">${date(inv.period_start)} – ${date(inv.period_end)}</span>` : ''}
             </div>
             <div class="sbw-invoice-amt">
                 <strong>${money(inv.due_amount)} ${esc(p.currency)}</strong>
