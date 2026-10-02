@@ -242,6 +242,14 @@ function renderInvoices(p) {
         </div>`).join('')}</div>`;
 }
 
+// Previous due + this period's fee, each shown only when owed.
+function renderDueBreakdown(p) {
+    const row = (label, value) => Number(value) > 0
+        ? `<p class="sbw-kv"><span>${label}</span><strong>${money(value)} ${esc(p.currency)}</strong></p>`
+        : '';
+    return row('Previous due', p.previous_due) + row('Current subscription fee', p.current_fee_due);
+}
+
 function renderPayment(p) {
     const info = p.payment_info || {};
     const rows = paymentInfoRows(info);
@@ -253,9 +261,10 @@ function renderPayment(p) {
             ${(p.greeting || []).map((g) => `<p>${esc(g)}</p>`).join('')}
             <p>${esc(paymentHeadline(p))}</p>
             <div class="sbw-amount">
-                <span class="sbw-label">Amount due</span>
+                <span class="sbw-label">Total due</span>
                 <strong>${money(p.due_amount)} ${esc(p.currency)}</strong>
             </div>
+            ${renderDueBreakdown(p)}
             ${p.monthly_fee != null && p.monthly_fee !== '' ? `<p class="sbw-kv"><span>${p.plan === 'lifetime' ? 'Monthly update subscription' : 'Monthly fee'}</span><strong>${money(p.monthly_fee)} ${esc(p.currency)}</strong></p>` : ''}
             ${p.paid_through ? `<p class="sbw-kv"><span>Paid through</span><strong>${date(p.paid_through)}</strong></p>` : ''}
             ${renderInvoices(p)}
@@ -546,6 +555,7 @@ function renderPayModal(p) {
         <div class="sbw-modal-body">
             ${(p.greeting || []).map((g) => `<p>${esc(g)}</p>`).join('')}
             <p>${esc(paymentHeadline(p))}</p>
+            ${renderDueBreakdown(p)}
             ${renderInvoices(p)}
             ${rows.length ? `<div class="sbw-box"><span class="sbw-label">How to pay</span>${rows.map((r) => `<p>${r}</p>`).join('')}</div>` : ''}
             <div class="sbw-actions">

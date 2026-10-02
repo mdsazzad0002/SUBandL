@@ -105,7 +105,7 @@ class WidgetController extends Controller
     private function payment(LicenseState $state): ?array
     {
         $billing = $state->billing();
-        $due = (float) ($state->due_amount ?? 0);
+        $due = $state->totalDue();
         $late = $state->isPaymentLate() || $state->status === 'expired';
 
         if ($due <= 0 && ! $late) {
@@ -113,7 +113,10 @@ class WidgetController extends Controller
         }
 
         return [
-            'due_amount' => $state->due_amount,
+            // What to pay now = previous unpaid balance + this period's fee.
+            'due_amount' => $due,
+            'previous_due' => $state->previousDue(),
+            'current_fee_due' => $state->currentFeeDue(),
             'monthly_fee' => $state->monthly_fee,
             'currency' => $billing['currency'] ?? ($state->payment_info['currency'] ?? 'BDT'),
             'payment_info' => $state->payment_info,

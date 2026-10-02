@@ -243,7 +243,9 @@ export const LICENSE_FIELDS = [
     ['subscription_type', 'Plan'],
     ['paid_through', 'Paid through'],
     ['monthly_fee', 'Monthly fee'],
-    ['due_amount', 'Due amount'],
+    ['previous_due', 'Previous due'],
+    ['current_fee_due', 'Current subscription fee'],
+    ['due_amount', 'Total due'],
     ['next_due_date', 'Next due date'],
     ['last_verified_at', 'Last verified'],
 ];

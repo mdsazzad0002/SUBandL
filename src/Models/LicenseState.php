@@ -138,10 +138,38 @@ class LicenseState extends Model
         return (bool) ($this->billing()['payment_late'] ?? $this->in_grace_period);
     }
 
+    /** Earlier unpaid balance (the provider's due_amount). */
+    public function previousDue(): float
+    {
+        return (float) ($this->billing()['due_amount'] ?? $this->due_amount ?? 0);
+    }
+
+    /**
+     * The subscription fee owed for the current period (the provider's
+     * fee_due_amount). A late payment with nothing itemised still owes this
+     * period's fee, so the monthly fee stands in for it.
+     */
+    public function currentFeeDue(): float
+    {
+        $fee = (float) ($this->billing()['fee_due_amount'] ?? 0);
+
+        if ($fee <= 0 && $this->previousDue() <= 0 && $this->isPaymentLate()) {
+            $fee = (float) ($this->billing()['monthly_fee'] ?? $this->monthly_fee ?? 0);
+        }
+
+        return $fee;
+    }
+
+    /** Previous due + this period's fee: what the client has to pay now. */
+    public function totalDue(): float
+    {
+        return $this->previousDue() + $this->currentFeeDue();
+    }
+
     /** Money is owed, grace is running, or the license is unusable. */
     public function needsAttention(): bool
     {
-        return (float) $this->due_amount > 0 || $this->in_grace_period || $this->isPaymentLate() || ! $this->isUsable();
+        return $this->totalDue() > 0 || $this->in_grace_period || $this->isPaymentLate() || ! $this->isUsable();
     }
 
     /**
