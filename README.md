@@ -165,7 +165,7 @@ use SUBandL\Facades\SUBandL;
 SUBandL::isValid();                   // cached, no HTTP call
 SUBandL::state()->expires_at;         // the full license row
 SUBandL::verify(force: true);         // live check
-SUBandL::module('careflow');          // ['ok' => true, 'enabled' => true, 'message' => null] via /api/careflow-status
+SUBandL::module('careflow');          // ['ok' => true, 'enabled' => true, 'message' => null] via /api/feature-status
 SUBandL::checkUpdate();               // notify only
 SUBandL::update();                    // applies the next single version step
 SUBandL::backup(force: true);

@@ -120,8 +120,8 @@ class LicenseClient
     }
 
     /**
-     * Live entitlement check for an optional module: POSTs to
-     * /api/{module}-status (e.g. checkModule('careflow') → /api/careflow-status).
+     * Live entitlement check for an optional module: POSTs the feature key to
+     * /api/feature-status (e.g. checkModule('careflow') → feature=careflow).
      * Meant for the moment an admin turns a module ON; turning one off never
      * needs provider approval.
      *
@@ -129,12 +129,13 @@ class LicenseClient
      */
     public function checkModule(string $module): array
     {
-        $endpoint = str_ends_with($module, '-status') ? $module : "{$module}-status";
+        $feature = str_ends_with($module, '-status') ? substr($module, 0, -7) : $module;
 
         try {
-            $response = $this->send($endpoint, [
+            $response = $this->send('feature-status', [
                 'software' => config('subandl.software_slug'),
                 'license_key' => LicenseState::resolveLicenseKey(),
+                'feature' => $feature,
             ], 'license');
         } catch (ConnectionException $exception) {
             return [

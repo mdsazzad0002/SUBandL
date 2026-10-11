@@ -57,7 +57,7 @@ class SUBandL
     }
 
     /**
-     * Live entitlement check for an optional module (/api/{module}-status).
+     * Live entitlement check for an optional module (/api/feature-status).
      *
      * @return array{ok: bool, enabled: bool, message: ?string}
      */
