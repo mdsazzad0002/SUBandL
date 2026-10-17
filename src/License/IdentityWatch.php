@@ -67,7 +67,14 @@ class IdentityWatch
         }
 
         $installation = InstallationIdentity::current();
+        // Behind reverse proxies getHttpHost() may reflect an internal host
+        // unless trusted proxy headers are configured. Prefer the app URL's
+        // canonical host to avoid false domain-change verdicts.
         $domain = self::domain($request->getHttpHost());
+        $canonical = self::domain(parse_url((string) config('app.url'), PHP_URL_HOST));
+        if ($canonical !== null) {
+            $domain = $canonical;
+        }
         $knownDomain = self::domain($installation->domain);
 
         $baseline = [];
@@ -100,6 +107,10 @@ class IdentityWatch
 
         $installation = InstallationIdentity::current();
         $domain = $request ? self::domain($request->getHttpHost()) : null;
+        $canonical = self::domain(parse_url((string) config('app.url'), PHP_URL_HOST));
+        if ($canonical !== null) {
+            $domain = $canonical;
+        }
 
         $installation->forceFill(array_filter([
             'fingerprint' => self::device(),
