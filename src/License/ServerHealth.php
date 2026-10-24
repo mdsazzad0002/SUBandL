@@ -4,8 +4,8 @@ namespace SUBandL\License;
 
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
-use Illuminate\Support\Facades\Http;
 use SUBandL\Models\ActivityLog;
+use SUBandL\Support\HttpClient;
 
 /**
  * Whether the provider is currently reachable, used to gate license/update/backup
@@ -112,7 +112,7 @@ class ServerHealth
 
         for ($attempt = 1; $attempt <= $attempts; $attempt++) {
             try {
-                $response = Http::acceptJson()->timeout($timeout)->get($url);
+                $response = HttpClient::request()->acceptJson()->timeout($timeout)->get($url);
                 if ($response->successful()) {
                     Cache::forget(self::BACKOFF_KEY);
                     $this->record(true);

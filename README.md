@@ -98,6 +98,23 @@ Add the system cron (`* * * * * php artisan schedule:run`) when you can. Without
 
 ---
 
+## Runs on any host
+
+Linux (Ubuntu/Debian/CentOS, cPanel, Plesk, CloudLinux, CyberPanel/LiteSpeed), macOS (Homebrew, MAMP, XAMPP) and Windows (XAMPP, WAMP, Laragon, IIS) work without configuration:
+
+| Concern | How it is handled |
+|---|---|
+| Background tasks | `nohup setsid` on Linux, `nohup` on macOS, `start /B` on Windows. With `exec`/`popen` disabled, the web scheduler runs the check after the response (PHP-FPM / LiteSpeed) and the buttons run inline. |
+| CLI `php` | Found automatically, even under php-fpm, Apache mod_php (XAMPP/WAMP, where `PHP_BINARY` is `httpd.exe`) or IIS. Only a binary of the site's own PHP version is used. Override: `SUBANDL_PHP_BINARY`. |
+| Database backup | `mysqldump` / `mariadb-dump` / `pg_dump` from the PATH or the stack's own folder (`C:\xampp\mysql\bin`, `C:\wamp64\bin\mysql\*\bin`, Laragon, MAMP, Homebrew, `/opt/lampp`). Without it (or with `proc_open` disabled) MySQL/MariaDB is dumped by the built-in PHP dumper — tables, data, views and triggers, restorable with `mysql` or phpMyAdmin. Override: `SUBANDL_MYSQLDUMP`, `SUBANDL_PG_DUMP`. |
+| HTTPS to the provider | php.ini's CA file, else the bundle from `composer/ca-bundle` — XAMPP/WAMP PHP has none and would fail with *cURL error 60*. Override: `SUBANDL_HTTP_VERIFY` (a CA file path). |
+| Updates | Need the PHP `zip` extension (`extension=zip` in php.ini — off in a fresh XAMPP); the update screen says so when it is missing. `.env` keeps its own line endings. |
+| Restricted hosts | `open_basedir` and `disable_functions` (`exec`, `proc_open`, `set_time_limit`) never cause an error; the package uses whatever is allowed. |
+
+`php artisan subandl:status` ends with an **Environment** table showing what this host will use (CLI php, background method, dump tool, CA bundle, zip, writable storage).
+
+---
+
 ## Global widget
 
 `InjectWidget` adds a small edge tab to every page for signed-in users. You don't need to change any layout. It works the same in Blade, Vue and React apps, and it follows Inertia page visits. The tab opens an offcanvas panel (1000px wide, at most 75% of the screen, full width on phones) with two tabs:

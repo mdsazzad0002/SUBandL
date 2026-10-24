@@ -4,9 +4,9 @@ namespace SUBandL\License;
 
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\PendingRequest;
-use Illuminate\Support\Facades\Http;
 use SUBandL\Models\ActivityLog;
 use SUBandL\Models\LicenseState;
+use SUBandL\Support\HttpClient;
 
 /**
  * Talks to the provider's licensing API. Endpoints and payload/response shapes
@@ -227,7 +227,7 @@ class LicenseClient
 
     private function http(): PendingRequest
     {
-        return Http::acceptJson()->timeout((int) config('subandl.http_timeout', 15));
+        return HttpClient::request()->acceptJson()->timeout((int) config('subandl.http_timeout', 15));
     }
 
     private function mapStatus(string $apiStatus): string

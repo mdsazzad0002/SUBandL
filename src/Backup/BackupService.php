@@ -4,7 +4,6 @@ namespace SUBandL\Backup;
 
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Support\Carbon;
-use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Process;
 use SUBandL\Events\BackupFinished;
 use SUBandL\License\LicenseClient;
@@ -12,6 +11,8 @@ use SUBandL\License\ServerHealth;
 use SUBandL\Models\ActivityLog;
 use SUBandL\Models\BackupHistory;
 use SUBandL\Models\LicenseState;
+use SUBandL\Support\HttpClient;
+use SUBandL\Support\Platform;
 
 /**
  * Uploads a database backup to the provider using its chunked
@@ -22,7 +23,9 @@ use SUBandL\Models\LicenseState;
  * there has been no successful backup for 24 hours (backup_daily_minimum).
  * A forced run ("Backup Now") ignores the toggle and the schedule.
  *
- * Supports mysql/mariadb (mysqldump), pgsql (pg_dump) and sqlite (file copy).
+ * Supports mysql/mariadb (mysqldump, or a pure-PHP dump where mysqldump is
+ * missing or can't run), pgsql (pg_dump) and sqlite (file copy) — on Linux,
+ * macOS and Windows (XAMPP, WAMP, Laragon).
  */
 class BackupService
 {
@@ -308,7 +311,7 @@ class BackupService
                 $lastMessage = null;
                 for ($attempt = 1; $attempt <= $retryAttempts; $attempt++) {
                     try {
-                        $chunkResponse = Http::acceptJson()->timeout(60)
+                        $chunkResponse = HttpClient::request()->acceptJson()->timeout(60)
                             ->attach('chunk', $chunk, "{$index}.part")
                             ->post($this->client->url('backup/chunk'), $common + [
                                 'backup_id' => $backupId,
@@ -373,7 +376,7 @@ class BackupService
 
         for ($attempt = 1; ; $attempt++) {
             try {
-                $response = Http::acceptJson()->timeout($timeout)->post($this->client->url($endpoint), $payload);
+                $response = HttpClient::request()->acceptJson()->timeout($timeout)->post($this->client->url($endpoint), $payload);
 
                 if (! $response->serverError() || $attempt >= $attempts) {
                     return $response;
@@ -402,8 +405,8 @@ class BackupService
         $driver = $config['driver'] ?? 'mysql';
 
         $dir = $this->stagingPath();
-        if (! is_dir($dir)) {
-            mkdir($dir, 0755, true);
+        if (! is_dir($dir) && ! @mkdir($dir, 0755, true) && ! is_dir($dir)) {
+            return ['path' => null, 'message' => "Could not create the staging folder '{$dir}'."];
         }
         $base = $dir . DIRECTORY_SEPARATOR . 'database-' . now()->format('Y-m-d-H-i-s');
 
@@ -415,9 +418,44 @@ class BackupService
         };
     }
 
+    /**
+     * mysqldump when it can be found and run; otherwise (or when it fails) the
+     * pure-PHP dumper, unless backup.php_fallback is switched off.
+     */
     private function dumpMysql(array $config, string $path): array
     {
-        $command = [config('subandl.backup.mysqldump_binary', 'mysqldump')];
+        $binary = DumpBinary::find((string) config('subandl.backup.mysqldump_binary', 'mysqldump'), ['mysqldump', 'mariadb-dump'], 'mysql');
+        $cliError = null;
+
+        if ($binary === null) {
+            $cliError = 'mysqldump was not found';
+        } elseif (! Platform::functionEnabled('proc_open')) {
+            $cliError = 'proc_open is disabled, so mysqldump cannot run';
+        } else {
+            $result = $this->runMysqldump($binary, $config, $path);
+            if ($result['path']) {
+                return $result;
+            }
+            $cliError = 'mysqldump failed: ' . ($result['message'] ?: 'no output');
+        }
+
+        if (! config('subandl.backup.php_fallback', true)) {
+            return ['path' => null, 'message' => $cliError . '. Set subandl.backup.mysqldump_binary to its full path.'];
+        }
+
+        $result = (new PhpMysqlDumper())->dump($config, $path);
+        if ($result['path']) {
+            ActivityLog::record('backup', true, "Used the built-in PHP dump ({$cliError}).");
+
+            return $result;
+        }
+
+        return ['path' => null, 'message' => $cliError . '; ' . ($result['message'] ?? 'PHP dump failed.')];
+    }
+
+    private function runMysqldump(string $binary, array $config, string $path, bool $noColumnStatistics = false): array
+    {
+        $command = [$binary];
 
         if (! empty($config['unix_socket'])) {
             $command[] = '--socket=' . $config['unix_socket'];
@@ -428,27 +466,58 @@ class BackupService
 
         $command[] = '--user=' . ($config['username'] ?? '');
         array_push($command, ...(array) config('subandl.backup.mysqldump_options', []));
+        if ($noColumnStatistics) {
+            $command[] = '--column-statistics=0';
+        }
         // Written straight to disk rather than buffered through PHP, so a large
         // database never has to fit in memory.
         $command[] = '--result-file=' . $path;
         $command[] = $config['database'] ?? '';
 
-        $result = Process::timeout(3600)->env(['MYSQL_PWD' => (string) ($config['password'] ?? '')])->run($command);
+        try {
+            $result = Process::timeout(3600)->env(['MYSQL_PWD' => (string) ($config['password'] ?? '')])->run($command);
+        } catch (\Throwable $e) {
+            @unlink($path);
 
-        return $this->dumpResult($result, $path);
+            return ['path' => null, 'message' => $e->getMessage()];
+        }
+
+        $dump = $this->dumpResult($result, $path);
+
+        // A MySQL 8 client against a MariaDB / older MySQL server (a common
+        // WAMP / XAMPP mix) fails on COLUMN_STATISTICS unless told not to.
+        if (! $dump['path'] && ! $noColumnStatistics && stripos((string) ($dump['message'] ?? ''), 'column_statistics') !== false) {
+            return $this->runMysqldump($binary, $config, $path, true);
+        }
+
+        return $dump;
     }
 
     private function dumpPgsql(array $config, string $path): array
     {
-        $result = Process::timeout(3600)->env(['PGPASSWORD' => (string) ($config['password'] ?? '')])->run([
-            config('subandl.backup.pg_dump_binary', 'pg_dump'),
-            '--host=' . ($config['host'] ?? '127.0.0.1'),
-            '--port=' . ($config['port'] ?? 5432),
-            '--username=' . ($config['username'] ?? ''),
-            '--no-owner',
-            '--file=' . $path,
-            $config['database'] ?? '',
-        ]);
+        $binary = DumpBinary::find((string) config('subandl.backup.pg_dump_binary', 'pg_dump'), ['pg_dump'], 'pgsql');
+        if ($binary === null) {
+            return ['path' => null, 'message' => 'pg_dump was not found. Set subandl.backup.pg_dump_binary to its full path.'];
+        }
+        if (! Platform::functionEnabled('proc_open')) {
+            return ['path' => null, 'message' => 'proc_open is disabled on this server, so pg_dump cannot run.'];
+        }
+
+        try {
+            $result = Process::timeout(3600)->env(['PGPASSWORD' => (string) ($config['password'] ?? '')])->run([
+                $binary,
+                '--host=' . ($config['host'] ?? '127.0.0.1'),
+                '--port=' . ($config['port'] ?? 5432),
+                '--username=' . ($config['username'] ?? ''),
+                '--no-owner',
+                '--file=' . $path,
+                $config['database'] ?? '',
+            ]);
+        } catch (\Throwable $e) {
+            @unlink($path);
+
+            return ['path' => null, 'message' => $e->getMessage()];
+        }
 
         return $this->dumpResult($result, $path);
     }
@@ -466,10 +535,11 @@ class BackupService
 
     private function dumpResult(\Illuminate\Contracts\Process\ProcessResult $result, string $path): array
     {
+        clearstatcache(true, $path);
         if (! $result->successful() || ! is_file($path) || filesize($path) === 0) {
             @unlink($path);
 
-            return ['path' => null, 'message' => trim($result->errorOutput())];
+            return ['path' => null, 'message' => trim($result->errorOutput()) ?: trim($result->output())];
         }
 
         return ['path' => $path];

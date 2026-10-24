@@ -34,6 +34,20 @@ return [
 
     'http_timeout' => 15,
 
+    // HTTPS certificate check for provider calls. null = automatic (php.ini's
+    // curl.cainfo, else the bundle from composer/ca-bundle — needed on XAMPP /
+    // WAMP, whose PHP has none). A path uses that CA file; false disables
+    // verification (not recommended).
+    'http' => [
+        'verify' => env('SUBANDL_HTTP_VERIFY'),
+    ],
+
+    // The CLI php used for background tasks and post-update commands. Empty =
+    // found automatically (Linux distros, cPanel/Plesk/CloudLinux/LiteSpeed,
+    // Homebrew, MAMP, XAMPP, WAMP, Laragon). Set it when the host keeps php
+    // somewhere unusual, e.g. C:\php\php.exe or /opt/php83/bin/php.
+    'php_binary' => env('SUBANDL_PHP_BINARY', ''),
+
     // How long a cached verification is trusted before an automatic
     // (non-forced) refresh attempts another live check. 2880 = once every 2 days.
     // Explicit user actions (Save License, Refresh) always check live.
@@ -260,9 +274,14 @@ return [
         'staging_path' => storage_path('app/backup-staging'),
         'chunk_size' => 2 * 1024 * 1024,
         'chunk_retry_attempts' => 5,
-        'mysqldump_binary' => 'mysqldump',
+        // A name is looked up on the PATH and in the usual XAMPP / WAMP /
+        // Laragon / MAMP / Homebrew folders; a full path is used as-is.
+        'mysqldump_binary' => env('SUBANDL_MYSQLDUMP', 'mysqldump'),
         'mysqldump_options' => ['--single-transaction', '--quick'],
-        'pg_dump_binary' => 'pg_dump',
+        // When mysqldump is missing or can't run (proc_open disabled), dump
+        // MySQL / MariaDB with the built-in PHP dumper instead.
+        'php_fallback' => true,
+        'pg_dump_binary' => env('SUBANDL_PG_DUMP', 'pg_dump'),
     ],
 
     /*

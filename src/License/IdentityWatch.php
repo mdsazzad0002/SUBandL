@@ -41,8 +41,27 @@ class IdentityWatch
         return $host;
     }
 
-    /** This machine + install folder, hashed. */
+    /**
+     * This machine + install folder, hashed. The folder is normalised so the
+     * web server and the CLI agree on it: symlinks resolved, forward slashes,
+     * and on Windows case-folded (Apache may say C:\xampp, a console c:\xampp).
+     */
     public static function device(): string
+    {
+        $path = @realpath(base_path()) ?: base_path();
+        $path = rtrim(str_replace('\\', '/', $path), '/');
+        $host = php_uname('n');
+
+        if (PHP_OS_FAMILY === 'Windows') {
+            $path = strtolower($path);
+            $host = strtolower($host);
+        }
+
+        return sha1($host . '|' . $path);
+    }
+
+    /** The fingerprint as computed before it was normalised — still accepted. */
+    private static function legacyDevice(): string
     {
         return sha1(php_uname('n') . '|' . base_path());
     }
@@ -83,6 +102,11 @@ class IdentityWatch
         }
         if ($knownDomain === null && $domain !== null) {
             $baseline['domain'] = $domain;
+        }
+        // Recorded with the old formula on this same machine and folder:
+        // upgrade it quietly rather than report a device change.
+        if ($installation->fingerprint && $installation->fingerprint !== self::device() && $installation->fingerprint === self::legacyDevice()) {
+            $baseline['fingerprint'] = self::device();
         }
         if ($baseline) {
             $installation->forceFill($baseline)->save();

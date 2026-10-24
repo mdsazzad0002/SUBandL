@@ -1,0 +1,10 @@
+# Keep LF everywhere (a Windows checkout with core.autocrlf would otherwise
+# rewrite the files as CRLF and show every file as changed).
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary

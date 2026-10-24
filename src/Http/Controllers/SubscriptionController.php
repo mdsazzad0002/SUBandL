@@ -19,6 +19,7 @@ use SUBandL\Models\UpdateHistory;
 use SUBandL\SUBandL;
 use SUBandL\Support\Access;
 use SUBandL\Support\BackgroundArtisan;
+use SUBandL\Support\Platform;
 use SUBandL\Support\UpdateNotice;
 use SUBandL\Update\UpdateApplier;
 
@@ -187,7 +188,7 @@ class SubscriptionController extends Controller
         }
 
         // Couldn't spawn a process (exec disabled) — run inline so the button still works.
-        set_time_limit(0);
+        Platform::allowLongRunning();
         $result = $service->runBackup(force: true);
 
         return response()->json($result, ($result['ok'] ?? false) ? 200 : 422);
@@ -208,7 +209,7 @@ class SubscriptionController extends Controller
             return response()->json(['ok' => true, 'dispatched' => true]);
         }
 
-        set_time_limit(0);
+        Platform::allowLongRunning();
 
         return response()->json($service->runBackup(force: false));
     }
@@ -313,7 +314,7 @@ class SubscriptionController extends Controller
             ], 409);
         }
 
-        set_time_limit(0);
+        Platform::allowLongRunning();
 
         $fromVersion = (string) config('subandl.version', '1.0.0');
 

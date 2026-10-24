@@ -3,13 +3,13 @@
 namespace SUBandL\Update;
 
 use Illuminate\Support\Facades\Artisan;
-use Illuminate\Support\Facades\Http;
 use SUBandL\Backup\BackupService;
 use SUBandL\Events\UpdateFinished;
 use SUBandL\Models\ActivityLog;
 use SUBandL\Models\LicenseState;
 use SUBandL\Models\UpdateHistory;
 use SUBandL\Support\CliPhpBinary;
+use SUBandL\Support\HttpClient;
 use SUBandL\Support\UpdateNotice;
 use Symfony\Component\Process\Process;
 use ZipArchive;
@@ -129,9 +129,13 @@ class UpdateApplier
         }
         $backupId = $backupResult['backup_id'] ?? null;
 
+        if (! class_exists(ZipArchive::class)) {
+            return ['ok' => false, 'message' => 'The PHP zip extension is not enabled. Enable it in php.ini (extension=zip) and restart the web server.'];
+        }
+
         $stagingDir = rtrim((string) config('subandl.update.staging_path', storage_path('app/update-staging')), '/\\');
-        if (! is_dir($stagingDir)) {
-            mkdir($stagingDir, 0755, true);
+        if (! is_dir($stagingDir) && ! @mkdir($stagingDir, 0755, true) && ! is_dir($stagingDir)) {
+            return ['ok' => false, 'message' => "Could not create the update staging folder '{$stagingDir}'."];
         }
 
         $zipPath = $stagingDir . DIRECTORY_SEPARATOR . 'update-' . now()->format('YmdHis') . '.zip';
@@ -142,7 +146,7 @@ class UpdateApplier
             $attempts = max(2, (int) config('subandl.live_attempts', 2));
             for ($attempt = 1; ; $attempt++) {
                 try {
-                    $response = Http::timeout((int) config('subandl.update.download_timeout', 300))
+                    $response = HttpClient::request()->timeout((int) config('subandl.update.download_timeout', 300))
                         ->sink($zipPath)
                         ->get($downloadUrl);
 
@@ -414,12 +418,14 @@ class UpdateApplier
         }
 
         $content = (string) file_get_contents($envPath);
+        // Keep the file's own line endings (CRLF when edited on Windows).
+        $eol = str_contains($content, "\r\n") ? "\r\n" : "\n";
         $line = $key . '=' . $version;
-        $pattern = '/^' . preg_quote($key, '/') . '=.*$/m';
+        $pattern = '/^' . preg_quote($key, '/') . '=[^\r\n]*/m';
 
         $content = preg_match($pattern, $content)
             ? preg_replace($pattern, $line, $content)
-            : rtrim($content) . "\n" . $line . "\n";
+            : rtrim($content) . $eol . $line . $eol;
 
         file_put_contents($envPath, $content);
     }
@@ -503,11 +509,13 @@ class UpdateApplier
             $output = $process->getOutput() . $process->getErrorOutput();
 
             // 126/127: the php binary is missing or not executable on this host
-            // (common under LiteSpeed/CyberPanel); or it is a different PHP
-            // version that Composer's platform check rejects — run in-process
-            // instead of failing the update over a path lookup.
-            $wrongBinary = in_array($process->getExitCode(), [126, 127], true)
-                || str_contains($output, 'Your Composer dependencies require a PHP version');
+            // (common under LiteSpeed/CyberPanel); Windows says so in words
+            // with exit 1/9009; or it is a different PHP version that
+            // Composer's platform check rejects — run in-process instead of
+            // failing the update over a path lookup.
+            $wrongBinary = in_array($process->getExitCode(), [126, 127, 9009], true)
+                || str_contains($output, 'Your Composer dependencies require a PHP version')
+                || preg_match('/is not recognized as an internal or external command|The system cannot find the (path|file) specified/i', $output);
 
             if (! $wrongBinary) {
                 return [

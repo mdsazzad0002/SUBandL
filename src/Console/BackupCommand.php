@@ -5,6 +5,7 @@ namespace SUBandL\Console;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 use SUBandL\Backup\BackupService;
+use SUBandL\Support\Platform;
 
 class BackupCommand extends Command
 {
@@ -15,7 +16,7 @@ class BackupCommand extends Command
     public function handle(BackupService $service): int
     {
         // A large dump + chunked upload can legitimately take minutes.
-        set_time_limit(0);
+        Platform::allowLongRunning();
 
         $result = $service->runBackup(force: (bool) $this->option('force'));
 

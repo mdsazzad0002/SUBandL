@@ -5,7 +5,9 @@ namespace SUBandL\Http\Middleware;
 use Closure;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Artisan;
 use SUBandL\Support\BackgroundArtisan;
+use SUBandL\Support\Platform;
 
 /**
  * Poor-man's cron: fires the license, update and backup checks from
@@ -45,10 +47,34 @@ class RunScheduledTasks
 
             if ($due <= time() && Cache::add("subandl:scheduler:{$command}:claim", true, 60)) {
                 Cache::forever($key, time() + $ttlSeconds);
-                BackgroundArtisan::dispatch($command);
+                if (! BackgroundArtisan::dispatch($command)) {
+                    $this->runAfterResponse($command);
+                }
             }
         }
 
         return $next($request);
+    }
+
+    /**
+     * No process could be spawned (exec and popen disabled). Where the server
+     * can hand the page to the browser first — PHP-FPM, LiteSpeed — run the
+     * check in this process once the response is out, so the visitor never
+     * waits for it. Elsewhere (mod_php) the next system cron run picks it up.
+     */
+    private function runAfterResponse(string $command): void
+    {
+        if (! Platform::functionEnabled('fastcgi_finish_request') && ! Platform::functionEnabled('litespeed_finish_request')) {
+            return;
+        }
+
+        app()->terminating(function () use ($command) {
+            Platform::allowLongRunning();
+            try {
+                Artisan::call($command);
+            } catch (\Throwable $e) {
+                report($e);
+            }
+        });
     }
 }
