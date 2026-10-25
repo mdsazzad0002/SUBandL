@@ -115,6 +115,52 @@ class LicenseState extends Model
     }
 
     /**
+     * The software's tutorial videos from the last verification, the intro
+     * video first: [['title', 'url', 'youtube_id', 'thumbnail'], …]. The
+     * thumbnail is YouTube's own still, null for links that aren't YouTube.
+     *
+     * @return array<int, array{title: string, url: string, youtube_id: ?string, thumbnail: ?string}>
+     */
+    public function videos(): array
+    {
+        $software = $this->last_verification_response['software'] ?? null;
+        if (! is_array($software)) {
+            return [];
+        }
+
+        $list = is_array($software['videos'] ?? null) ? $software['videos'] : [];
+        if (! empty($software['intro_video_url']) && is_string($software['intro_video_url'])) {
+            array_unshift($list, ['title' => 'Introduction', 'url' => $software['intro_video_url']]);
+        }
+
+        $videos = [];
+        foreach ($list as $video) {
+            $url = is_array($video) ? ($video['url'] ?? null) : null;
+            if (! is_string($url) || ! preg_match('#^https?://#i', $url) || isset($videos[$url])) {
+                continue;
+            }
+
+            $id = self::youtubeId($url);
+            $videos[$url] = [
+                'title' => trim((string) ($video['title'] ?? '')) ?: 'Video',
+                'url' => $url,
+                'youtube_id' => $id,
+                'thumbnail' => $id ? "https://i.ytimg.com/vi/{$id}/hqdefault.jpg" : null,
+            ];
+        }
+
+        return array_values($videos);
+    }
+
+    /** youtu.be/ID, youtube.com/watch?v=ID, /embed/ID, /shorts/ID, /live/ID. */
+    public static function youtubeId(string $url): ?string
+    {
+        $pattern = '#^https?://(?:www\.|m\.)?(?:youtu\.be/|youtube(?:-nocookie)?\.com/(?:watch\?(?:.*&)?v=|embed/|shorts/|live/|v/))([A-Za-z0-9_-]{11})#i';
+
+        return preg_match($pattern, $url, $match) ? $match[1] : null;
+    }
+
+    /**
      * The provider's billing summary from the last verification (plan, fee,
      * due, paid-through, grace, open invoices). Empty for providers that
      * don't send one.

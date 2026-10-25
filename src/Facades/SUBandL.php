@@ -10,6 +10,7 @@ use Illuminate\Support\Facades\Facade;
  * @method static bool isValid()
  * @method static string|null licenseKey()
  * @method static \SUBandL\Models\LicenseState verify(bool $force = false)
+ * @method static array videos()
  * @method static array module(string $module)
  * @method static array checkUpdate()
  * @method static array update()

@@ -16,6 +16,7 @@ use SUBandL\Update\UpdateApplier;
  *   SUBandL::state()->expires_at;        // full cached license row
  *   SUBandL::module('careflow')['enabled'];
  *   SUBandL::verify(force: true);
+ *   SUBandL::videos();                   // tutorial videos from the portal (cached, no HTTP)
  *   SUBandL::update();                   // apply the next pending version, if any
  *   SUBandL::backup(force: true);
  */
@@ -54,6 +55,16 @@ class SUBandL
     public function verify(bool $force = false): LicenseState
     {
         return $this->verifier->refresh($force);
+    }
+
+    /**
+     * Tutorial videos the provider lists for this software (cached, no HTTP).
+     *
+     * @return array<int, array{title: string, url: string, youtube_id: ?string, thumbnail: ?string}>
+     */
+    public function videos(): array
+    {
+        return $this->state()->videos();
     }
 
     /**
