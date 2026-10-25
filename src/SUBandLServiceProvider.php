@@ -42,6 +42,7 @@ class SUBandLServiceProvider extends ServiceProvider
                 Console\LicenseCheckCommand::class,
                 Console\UpdateCheckCommand::class,
                 Console\BackupCommand::class,
+                Console\InstallerGenerateCommand::class,
             ]);
 
             $this->publishes([

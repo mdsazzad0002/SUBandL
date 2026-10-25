@@ -91,7 +91,7 @@ Open `/subscription`. Middleware, routes, the scheduler and the UI all register 
 | Routes | `/subscription`, `/subscription/{license,update,backup}`, `/license/*` JSON endpoints, `/subandl/widget` + `/subandl/assets/*` (widget), `/terms`, `/clear-cache`. Everything except `status` and `health-report` requires `auth`. |
 | Middleware | `EnsureLicenseValid` (redirects when the license is unusable), `RunScheduledTasks` (a web-triggered cron for hosts without one) and `InjectWidget` (adds the [global widget](#global-widget) to every HTML page). All three are appended to the `web` group and are also available as the `subandl.license`, `subandl.scheduler` and `subandl.widget` aliases. |
 | Scheduler | `subandl:license-check` every 30 minutes, `subandl:update-check` hourly (announces a new version; installs it only with `update_auto_apply`), `subandl:backup` every 15 minutes. Each one self-throttles. |
-| Commands | `subandl:install`, `subandl:status`, `subandl:license-check [--force]`, `subandl:update-check [--force]`, `subandl:backup [--force]` |
+| Commands | `subandl:install`, `subandl:status`, `subandl:license-check [--force]`, `subandl:update-check [--force]`, `subandl:backup [--force]`, `installergenerate` ([installer packages](#installer-packages)) |
 | Events | `SUBandL\Events\LicenseVerified`, `UpdateFinished`, `BackupFinished` |
 
 Add the system cron (`* * * * * php artisan schedule:run`) when you can. Without it, the web scheduler still triggers the checks from page visits.
@@ -251,6 +251,33 @@ Fix a behaviour once in `subandl.js`, or a style once in `subandl.css`, and all 
 Every page receives the same props: `currentVersion`, `tab`, `canUpdate`, `canBackup`, `licenseKey`, `backupEnabled`, `backupIntervalHours`, `base` and `urls {license, update, terms}`. The verification page gets `status` and `message` instead. Custom `inertia` pages receive these props too.
 
 To restyle the Blade pages: `php artisan vendor:publish --tag=subandl-views`.
+
+## Installer packages
+
+`php artisan installergenerate` packages the project into zips you can hand to a new customer. It asks for the version, the variants and the database mode, or takes them as options:
+
+```bash
+php artisan installergenerate --release=1.9.0 --all --db=fresh
+php artisan installergenerate --release=1.9.0 --variant=full --variant=no-vendor --db=none
+```
+
+| Variant | Leaves out |
+|---|---|
+| `full` | nothing |
+| `no-node` | `node_modules/` |
+| `no-vendor` | `vendor/` |
+| `no-assets` | `resources/js`, `resources/css` (the built `public/build` stays) |
+| `no-node-vendor`, `no-node-assets`, `no-vendor-assets` | both parts |
+| `minimal` | all three |
+
+| `--db` | Database in the zip |
+|---|---|
+| `fresh` (default) | Migrations and seeders (`--no-seed` to skip them) run into a scratch database, which is dumped and dropped. The project database is never touched. If the DB user can't create databases, pass an empty one with `--fresh-database=name`; otherwise it falls back to `schema`. |
+| `schema` | The current structure without data, except the `migrations` rows |
+| `current` | The current database with all its data |
+| `none` | No database |
+
+The database goes in at `database/installer/database.sql`. Every zip also holds an `INSTALL.txt` with the steps for that variant, an `installer.json` and a `.env.example` with `APP_VERSION` set. `.env`, `.git`, the contents of `storage/` (only its folder skeleton goes in), `bootstrap/cache` and symlinks are never packaged. The zips and a `SHA256SUMS.txt` go to `storage/installers/<version>/`. Paths and extra exclusions (such as `public/uploads`) are under `installer` in the config.
 
 ## Release package format (for the portal)
 

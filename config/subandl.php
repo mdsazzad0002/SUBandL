@@ -322,4 +322,22 @@ return [
         'after_update_commands' => ['config:clear', 'cache:clear', 'view:clear'],
     ],
 
+    /*
+    |--------------------------------------------------------------------------
+    | Installer packages (php artisan installergenerate)
+    |--------------------------------------------------------------------------
+    | .env, .git, the contents of storage/ and bootstrap/cache are always left out.
+    */
+    'installer' => [
+        'output_path' => storage_path('installers'),
+        // What the "no-assets" variants leave out (the built public/ files stay).
+        'asset_paths' => ['resources/js', 'resources/css'],
+        // Extra paths (relative to the project root) never packaged, e.g. 'public/uploads'.
+        'exclude' => [],
+        // Where the database file goes inside the zip (.sqlite for SQLite).
+        'database_path' => 'database/installer/database.sql',
+        // With --db=schema: tables whose rows are kept.
+        'schema_data_tables' => ['migrations'],
+    ],
+
 ];

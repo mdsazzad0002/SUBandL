@@ -28,11 +28,16 @@ class PhpMysqlDumper
 
     private PDO $pdo;
 
+    /** null = every table's rows; a list = rows only for these tables (structure for all). */
+    private ?array $dataTables = null;
+
     /**
      * @return array{path: ?string, message?: string}
      */
-    public function dump(array $config, string $path): array
+    public function dump(array $config, string $path, ?array $dataTables = null): array
     {
+        $this->dataTables = $dataTables;
+
         $out = @fopen($path, 'wb');
         if ($out === false) {
             return ['path' => null, 'message' => "Could not write '{$path}'."];
@@ -119,7 +124,16 @@ class PhpMysqlDumper
     {
         $q = $this->ident($table);
         $create = $this->pdo->query("SHOW CREATE TABLE {$q}")->fetch(PDO::FETCH_NUM)[1];
+        $withData = $this->dataTables === null || in_array($table, $this->dataTables, true);
+        if (! $withData) {
+            // A structure-only table starts counting from 1 again.
+            $create = (string) preg_replace('/\sAUTO_INCREMENT=\d+/', '', $create);
+        }
         $this->write($out, "\n--\n-- Table structure for {$q}\n--\n\nDROP TABLE IF EXISTS {$q};\n{$create};\n");
+
+        if (! $withData) {
+            return;
+        }
 
         $stmt = $this->pdo->prepare(
             'SELECT COLUMN_NAME, DATA_TYPE, EXTRA FROM information_schema.COLUMNS
