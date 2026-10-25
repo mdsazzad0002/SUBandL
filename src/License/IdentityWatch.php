@@ -67,7 +67,36 @@ class IdentityWatch
     {
         $request = self::browserRequest();
 
-        return self::isLocal($request ? $request->getHost() : self::knownDomain()) ? 'local' : 'live';
+        return self::bindingDomain($request) === null ? 'local' : 'live';
+    }
+
+    /**
+     * The domain this installation runs on, as sent to the provider:
+     *
+     *  1. APP_URL's host, when it is a real domain (canonical — www/IP visits agree);
+     *  2. else the browser request's host, when it is a real domain;
+     *  3. else nothing when APP_URL is explicitly localhost/an IP — a local install
+     *     (WAMP/XAMPP) has no domain, and must not send the one stored in a
+     *     database copied from a live site, not even from cron;
+     *  4. else (console, APP_URL unset) the known domain from the database.
+     */
+    public static function bindingDomain(?Request $request = null): ?string
+    {
+        $appHost = parse_url((string) config('app.url'), PHP_URL_HOST);
+
+        if ($canonical = self::domain($appHost)) {
+            return $canonical;
+        }
+
+        if ($domain = self::domain($request?->getHttpHost())) {
+            return $domain;
+        }
+
+        if (is_string($appHost) && $appHost !== '') {
+            return null;
+        }
+
+        return $request ? null : self::knownDomain();
     }
 
     /**

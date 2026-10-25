@@ -175,10 +175,9 @@ class LicenseClient
             'software' => config('subandl.software_slug'),
             'license_key' => LicenseState::resolveLicenseKey(),
             'device_id' => InstallationIdentity::current()->installation_uuid,
-            // A request on a real domain sends that domain. Background (console)
-            // checks and visits by IP/localhost send the known domain from the
-            // database instead, so the provider's domain binding applies to them too.
-            'domain' => IdentityWatch::domain(request()?->getHttpHost()) ?? IdentityWatch::knownDomain(),
+            // APP_URL's / the request's real domain; null on a local install,
+            // also from cron (see IdentityWatch::bindingDomain).
+            'domain' => IdentityWatch::bindingDomain(app()->runningInConsole() ? null : request()),
             // This machine (a hash of its serial, see IdentityWatch::device()),
             // for a provider that binds the device as well as the device_id.
             'device_fingerprint' => IdentityWatch::device(),
