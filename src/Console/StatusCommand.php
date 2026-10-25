@@ -4,10 +4,12 @@ namespace SUBandL\Console;
 
 use Illuminate\Console\Command;
 use SUBandL\Backup\DumpBinary;
+use SUBandL\License\IdentityWatch;
 use SUBandL\License\InstallationIdentity;
 use SUBandL\Models\LicenseState;
 use SUBandL\Support\BackgroundArtisan;
 use SUBandL\Support\CliPhpBinary;
+use SUBandL\Support\DeviceSerial;
 use SUBandL\Support\HttpClient;
 use SUBandL\Support\Platform;
 
@@ -27,6 +29,9 @@ class StatusCommand extends Command
             ['Software', config('subandl.software_slug')],
             ['Version', config('subandl.version')],
             ['Device ID', InstallationIdentity::current()->installation_uuid],
+            ['Device serial', DeviceSerial::get() ?? 'unavailable (host name + folder used)'],
+            ['Licensed domain', IdentityWatch::knownDomain() ?? 'not bound yet'],
+            ['Tamper', IdentityWatch::tamperReason() ?? 'none (browser-side check runs per request)'],
             ['License key', $key === '' ? '-' : substr($key, 0, 4) . str_repeat('*', max(0, strlen($key) - 8)) . substr($key, -4)],
             ['Status', $state->status . ($state->isUsable() ? ' (usable)' : ' (NOT usable)')],
             ['Subscription', $state->subscription_type ?? '-'],

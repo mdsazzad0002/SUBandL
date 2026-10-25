@@ -53,7 +53,7 @@ class EnsureLicenseValid
         if ($request->expectsJson() || $request->is('api/*')) {
             return response()->json([
                 'status' => false,
-                'reason' => $state->status,
+                'reason' => $state->effectiveStatus(),
                 'message' => 'License verification failed. Please contact your provider.',
             ], 403);
         }

@@ -149,9 +149,22 @@ Every live call is preceded by a server-side ping to the provider (`/api/ping`):
 
 Every step is written to the **activity log** (`license_activity_logs`), which appears in the History table on the Update & Backup page next to backups and updates. For example: "Provider unreachable after 2 attempts (Connection timed out); update check skipped. Next try after 21:48", or "/check-update answered on attempt 2". The Update card also shows whether the provider server is reachable and when the next try is.
 
-### Instant check on a device or domain change
+### Local or live, device serial and tamper detection
 
-The known device (machine + install folder) and domain are stored in the database (`license_installations.fingerprint` / `domain`). When a request comes from a different device or domain, the license is re-verified live right then (`verify_on_identity_change`). A copied install is caught on its first page load, and a legitimate move is confirmed just as fast. A first visit, a fresh install or an upgrade only records the baseline, without contacting the provider. The live call gives up after `identity_check_timeout` seconds (5); while the provider is down the page carries on with the stored state, and the check is retried after the health back-off. Background checks send the stored domain, so the provider's domain binding applies to them too. IP addresses and `localhost` never count as a domain.
+**Local or live.** Only a public domain is *live*. `localhost`, every IP address (private or public), a bare host name and dev names (`*.test`, `*.local`, `*.localhost`, `*.lan`, …) are *local*. The License tab shows which one the site is running on.
+
+**Device serial.** The device is the machine's own serial: the hardware (SMBIOS) UUID on Windows (MachineGuid when the board ships a placeholder), `IOPlatformUUID` on macOS and `/etc/machine-id` on Linux. It is read once and kept in the system temp folder, which is never copied with the project. The stored fingerprint (`license_installations.fingerprint`) is `sn:` + a hash of it. Where no serial can be read (`exec` disabled), host name + install folder is used as before, without enforcement.
+
+**Tampered.** The install counts as tampered, and access pauses with the reason on screen, when:
+
+- it is licensed for a public domain but is browsed locally (a copy of the live site opened on `localhost` or an IP), or
+- its fingerprint is a device serial of another machine.
+
+This is decided on every request and never stored: the provider sees the copied `device_id`, so a provider verdict can't clear it. Upgrading from an older version only records the serial; old host + folder fingerprints are never enforced. To move a site to a new machine on purpose, clear `fingerprint` in `license_installations` there. Every provider call also sends `device_fingerprint` and `environment`, for a provider that binds the device.
+
+When a request comes from a different public domain than the known one, the license is re-verified live right then (`verify_on_identity_change`). The live call gives up after `identity_check_timeout` seconds (5); while the provider is down the page carries on with the stored state. Background checks send the stored domain, so the provider's domain binding applies to them too.
+
+Behind a reverse proxy, configure trusted proxies so Laravel sees the public host. Otherwise the internal host or IP counts as local and the site reads as tampered.
 
 ### Instant refresh from the portal (webhook)
 

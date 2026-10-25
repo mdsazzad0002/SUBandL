@@ -9,6 +9,7 @@ use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Route;
 use SUBandL\Backup\BackupService;
+use SUBandL\License\IdentityWatch;
 use SUBandL\License\LicenseClient;
 use SUBandL\License\LicenseVerifier;
 use SUBandL\License\ServerHealth;
@@ -19,6 +20,7 @@ use SUBandL\Models\UpdateHistory;
 use SUBandL\SUBandL;
 use SUBandL\Support\Access;
 use SUBandL\Support\BackgroundArtisan;
+use SUBandL\Support\DeviceSerial;
 use SUBandL\Support\Platform;
 use SUBandL\Support\UpdateNotice;
 use SUBandL\Update\UpdateApplier;
@@ -42,8 +44,8 @@ class SubscriptionController extends Controller
         }
 
         return $this->render('verification_required', 'subandl::verification-required', [
-            'status' => $state->status,
-            'message' => $state->last_verification_error,
+            'status' => $state->effectiveStatus(),
+            'message' => IdentityWatch::tamperReason() ?? $state->last_verification_error,
         ]);
     }
 
@@ -482,7 +484,7 @@ class SubscriptionController extends Controller
         $backups = app(BackupService::class);
 
         return [
-            'status' => $state->status,
+            'status' => $state->effectiveStatus(),
             'license_key' => $state->license_key,
             // Exactly what every check sends as the binding. /license/status is
             // public, so only users with license access get it.
@@ -517,19 +519,24 @@ class SubscriptionController extends Controller
             'last_backup_at' => optional($state->last_backup_at)->toDateTimeString(),
             'last_backup_status' => $state->last_backup_status,
             'last_backup_message' => $state->last_backup_message,
-            'message' => $state->last_verification_error,
+            'message' => IdentityWatch::tamperReason() ?? $state->last_verification_error,
             'next_check_at' => $this->nextDueAt($state->last_verified_at, $state->needsAttention() ? (int) config('subandl.verify_cache_minutes_when_due', 30) : (int) config('subandl.verify_cache_minutes', 2880))->toDateTimeString(),
             'next_update_check_at' => $this->nextDueAt($state->last_update_check_at, (int) config('subandl.update_check_hours', 2) * 60)->toDateTimeString(),
             'next_backup_at' => $backups->nextDueAt($state)->toDateTimeString(),
         ];
     }
 
-    /** @return array{device_id: string, domain: ?string} */
+    /** @return array{device_id: string, domain: ?string, environment: string, device_serial: ?string} */
     private function identity(): array
     {
         $payload = app(LicenseClient::class)->identityPayload();
 
-        return ['device_id' => $payload['device_id'], 'domain' => $payload['domain']];
+        return [
+            'device_id' => $payload['device_id'],
+            'domain' => $payload['domain'],
+            'environment' => IdentityWatch::environment(),
+            'device_serial' => DeviceSerial::get(),
+        ];
     }
 
     /**

@@ -178,6 +178,10 @@ class LicenseClient
             // checks and visits by IP/localhost send the known domain from the
             // database instead, so the provider's domain binding applies to them too.
             'domain' => IdentityWatch::domain(request()?->getHttpHost()) ?? IdentityWatch::knownDomain(),
+            // This machine (a hash of its serial, see IdentityWatch::device()),
+            // for a provider that binds the device as well as the device_id.
+            'device_fingerprint' => IdentityWatch::device(),
+            'environment' => IdentityWatch::environment(),
             // 2 = understands billing summaries and locked update previews.
             'api_version' => 2,
         ];

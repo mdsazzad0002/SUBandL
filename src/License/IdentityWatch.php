@@ -5,48 +5,83 @@ namespace SUBandL\License;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Schema;
+use SUBandL\Support\DeviceSerial;
 
 /**
- * Notices the moment this installation shows up somewhere new, so the license
- * is re-verified right away instead of at the next scheduled check:
+ * Knows where this installation runs and whether that is where it is licensed:
  *
- *  - domain — the site is opened on a different (real) domain;
- *  - device — the code/database runs on a different machine or folder.
+ *  - environment — "live" on a public domain; "local" on localhost, any IP
+ *    (private or public) and dev names (a bare host name, *.test, *.local …);
+ *  - domain — the public domain the install was verified on;
+ *  - device — the machine's own serial (see DeviceSerial).
+ *
+ * An install is TAMPERED when it is licensed for a public domain but opened
+ * locally, or when it runs on another device than the one it is bound to.
+ * That is decided fresh on every request and never stored in the license
+ * state: the provider only sees the copied device_id, so its verdict can't
+ * tell a copy from the original and must not clear it.
  *
  * The known device and domain live in the database (license_installations:
- * fingerprint + domain), next to the installation identity. Nothing known
- * yet (first visit, fresh install, just upgraded) is NOT a change: the
- * current device/domain simply become the baseline, without contacting the
- * provider — so a first visit never depends on the provider being up.
- *
- * IPs and localhost are not domains (the provider doesn't bind them either),
- * so opening the site by IP never counts as a change.
+ * fingerprint + domain). Nothing known yet is NOT a change: the current
+ * device/domain become the baseline, without contacting the provider.
  */
 class IdentityWatch
 {
-    /** A real domain (lowercase, keeps a non-standard port), or null for IP/localhost. */
+    /** Marks a fingerprint taken from the device serial; older ones hash host name + folder. */
+    private const SERIAL_PREFIX = 'sn:';
+
+    /** Top-level names that never reach the public internet. */
+    private const LOCAL_TLDS = ['localhost', 'test', 'local', 'lan', 'internal', 'home', 'corp', 'intranet', 'private', 'invalid', 'example', 'arpa'];
+
+    private static ?string $tamper = null;
+
+    private static bool $tamperChecked = false;
+
+    /** A public domain (lowercase, keeps a non-standard port), or null when the host is local. */
     public static function domain(?string $host): ?string
     {
         $host = strtolower(trim((string) $host, ' .'));
         $bare = preg_replace('/:\d+$/', '', $host);
 
         if ($host === ''
-            || $bare === 'localhost'
-            || str_ends_with($bare, '.localhost')
             || filter_var(trim($bare, '[]'), FILTER_VALIDATE_IP) !== false
-            || filter_var(trim($host, '[]'), FILTER_VALIDATE_IP) !== false) {
+            || filter_var(trim($host, '[]'), FILTER_VALIDATE_IP) !== false
+            || ! str_contains($bare, '.')
+            || in_array(substr((string) strrchr($bare, '.'), 1), self::LOCAL_TLDS, true)) {
             return null;
         }
 
         return $host;
     }
 
+    public static function isLocal(?string $host): bool
+    {
+        return self::domain($host) === null;
+    }
+
     /**
-     * This machine + install folder, hashed. The folder is normalised so the
-     * web server and the CLI agree on it: symlinks resolved, forward slashes,
-     * and on Windows case-folded (Apache may say C:\xampp, a console c:\xampp).
+     * "live" or "local" for the host the site is browsed on. Console runs have
+     * none, so they go by the known domain.
+     */
+    public static function environment(): string
+    {
+        $request = self::browserRequest();
+
+        return self::isLocal($request ? $request->getHost() : self::knownDomain()) ? 'local' : 'live';
+    }
+
+    /**
+     * This machine: its serial when one can be read, else host name + install
+     * folder (symlinks resolved, forward slashes, case-folded on Windows).
      */
     public static function device(): string
+    {
+        $serial = DeviceSerial::get();
+
+        return $serial !== null ? self::SERIAL_PREFIX . sha1($serial) : self::hostFolderDevice();
+    }
+
+    private static function hostFolderDevice(): string
     {
         $path = @realpath(base_path()) ?: base_path();
         $path = rtrim(str_replace('\\', '/', $path), '/');
@@ -60,14 +95,8 @@ class IdentityWatch
         return sha1($host . '|' . $path);
     }
 
-    /** The fingerprint as computed before it was normalised — still accepted. */
-    private static function legacyDevice(): string
-    {
-        return sha1(php_uname('n') . '|' . base_path());
-    }
-
     /**
-     * The known real domain — sent as the binding domain by background
+     * The known public domain — sent as the binding domain by background
      * (console) checks, which have no request of their own.
      */
     public static function knownDomain(): ?string
@@ -76,12 +105,51 @@ class IdentityWatch
     }
 
     /**
-     * Whether this request comes from a device or domain other than the known
-     * one. Records a baseline (and never reports a change) when none is known.
+     * Why this install looks like a copy, or null. Worked out once per
+     * request (or console run).
+     */
+    public static function tamperReason(): ?string
+    {
+        if (self::$tamperChecked) {
+            return self::$tamper;
+        }
+        self::$tamperChecked = true;
+
+        try {
+            if (! self::ready()) {
+                return self::$tamper = null;
+            }
+            $installation = InstallationIdentity::current();
+        } catch (\Throwable $e) {
+            // No tables yet (fresh install, before the migration).
+            return self::$tamper = null;
+        }
+
+        $known = self::domain($installation->domain);
+        $request = self::browserRequest();
+        if ($known !== null && $request && self::isLocal($request->getHost())) {
+            return self::$tamper = "This installation is licensed for {$known}, but it is running on {$request->getHost()} (local).";
+        }
+
+        // Only a serial fingerprint is enforced, and only while this machine's
+        // serial can be read: a host that later disables exec must not lock out.
+        $stored = (string) $installation->fingerprint;
+        if (str_starts_with($stored, self::SERIAL_PREFIX) && DeviceSerial::get() !== null && $stored !== self::device()) {
+            return self::$tamper = 'This installation is licensed to another device.';
+        }
+
+        return self::$tamper = null;
+    }
+
+    /**
+     * Whether this request comes from a public domain other than the known
+     * one, so the provider should confirm the move. Records a baseline device
+     * and domain when none is known. A different device is not a "change" to
+     * re-verify — the provider can't tell a copy apart — see tamperReason().
      */
     public function changed(Request $request): bool
     {
-        if (! $this->ready()) {
+        if (! self::ready()) {
             return false;
         }
 
@@ -97,35 +165,33 @@ class IdentityWatch
         $knownDomain = self::domain($installation->domain);
 
         $baseline = [];
-        if (! $installation->fingerprint) {
-            $baseline['fingerprint'] = self::device();
+        $device = self::device();
+        $stored = (string) $installation->fingerprint;
+        // No device yet, or one from before device serials: this device becomes
+        // the baseline. An old host + folder hash is not enforced — a genuine
+        // site whose host name changed would be locked out, and the old code
+        // re-accepted those anyway.
+        if ($stored === '' || (! str_starts_with($stored, self::SERIAL_PREFIX) && $stored !== $device)) {
+            $baseline['fingerprint'] = $device;
         }
         if ($knownDomain === null && $domain !== null) {
             $baseline['domain'] = $domain;
         }
-        // Recorded with the old formula on this same machine and folder:
-        // upgrade it quietly rather than report a device change.
-        if ($installation->fingerprint && $installation->fingerprint !== self::device() && $installation->fingerprint === self::legacyDevice()) {
-            $baseline['fingerprint'] = self::device();
-        }
         if ($baseline) {
             $installation->forceFill($baseline)->save();
-        }
-
-        if ($installation->fingerprint !== self::device()) {
-            return true;
         }
 
         return $domain !== null && $knownDomain !== null && $domain !== $knownDomain;
     }
 
     /**
-     * The provider answered a verification for this device (+ domain): they
-     * are the known identity from now on.
+     * The provider answered a verification on this public domain: it is the
+     * known one from now on. The device is only filled in when none is known —
+     * never replaced, since the provider's answer can't vouch for a machine.
      */
     public function remember(?Request $request = null): void
     {
-        if (! $this->ready()) {
+        if (! self::ready()) {
             return;
         }
 
@@ -137,13 +203,18 @@ class IdentityWatch
         }
 
         $installation->forceFill(array_filter([
-            'fingerprint' => self::device(),
+            'fingerprint' => $installation->fingerprint ? null : self::device(),
             'domain' => $domain,
         ]))->save();
     }
 
+    private static function browserRequest(): ?Request
+    {
+        return app()->runningInConsole() ? null : request();
+    }
+
     /** The fingerprint column exists (the package migration has run). */
-    private function ready(): bool
+    private static function ready(): bool
     {
         if (Cache::get('subandl:identity-ready')) {
             return true;

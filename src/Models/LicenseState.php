@@ -94,7 +94,19 @@ class LicenseState extends Model
 
     public function isUsable(): bool
     {
-        return $this->status === 'active' && $this->code_integrity_ok;
+        return $this->status === 'active' && $this->code_integrity_ok && ! $this->isTampered();
+    }
+
+    /** A copy of a live install opened locally, or on another device (see IdentityWatch). */
+    public function isTampered(): bool
+    {
+        return \SUBandL\License\IdentityWatch::tamperReason() !== null;
+    }
+
+    /** The status to show: tampering overrides the provider's last verdict. */
+    public function effectiveStatus(): ?string
+    {
+        return $this->isTampered() ? 'tampered' : $this->status;
     }
 
     public function isMaintenanceExpired(): bool

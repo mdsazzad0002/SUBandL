@@ -304,8 +304,10 @@ function renderLicense() {
             </form>
             ${status.device_id ? `
             <div class="sbw-box">
-                <p class="sbw-kv"><span>Device ID</span><span class="sbw-code">${esc(status.device_id)}</span></p>
-                <p class="sbw-kv"><span>Domain</span><span class="sbw-code">${esc(status.domain || 'Not bound (localhost / IP)')}</span></p>
+                <p class="sbw-kv"><span>Running on</span><span class="sbw-badge sbw-${status.environment === 'live' ? 'ok' : 'info'}">${status.environment === 'live' ? 'Live domain' : 'Local (localhost / IP)'}</span></p>
+                <p class="sbw-kv"><span>Licensed domain</span><span class="sbw-code">${esc(status.domain || 'Not bound yet')}</span></p>
+                <p class="sbw-kv"><span>Device serial</span><span class="sbw-code">${esc(status.device_serial || 'Unavailable on this host')}</span></p>
+                <p class="sbw-kv"><span>Installation ID</span><span class="sbw-code">${esc(status.device_id)}</span></p>
             </div>` : ''}
             <p class="sbw-muted">By using this software you agree to the <a href="${esc(state.urls.terms)}">terms</a>.</p>
         </section>`;
