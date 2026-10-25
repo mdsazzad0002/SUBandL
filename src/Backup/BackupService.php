@@ -344,6 +344,13 @@ class BackupService
                 if (! $chunkResponse || ! $chunkResponse->successful()) {
                     return ['ok' => false, 'message' => $lastMessage ?? ('Chunk ' . $index . ' upload failed.')];
                 }
+
+                // Each request leaves Guzzle/cURL reference cycles that still hold
+                // the chunk body. PHP's GC is triggered by the number of cycles, not
+                // their size, so without this every chunk stays in memory and a
+                // ~60 MB dump exhausts a 128M memory_limit partway through.
+                unset($chunk, $chunkResponse);
+                gc_collect_cycles();
             }
         } finally {
             fclose($handle);
