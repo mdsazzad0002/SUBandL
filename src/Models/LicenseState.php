@@ -4,6 +4,7 @@ namespace SUBandL\Models;
 
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\Cache;
+use SUBandL\Support\MediaCache;
 
 class LicenseState extends Model
 {
@@ -141,15 +142,44 @@ class LicenseState extends Model
             }
 
             $id = self::youtubeId($url);
+            $thumbnail = $id ? "https://i.ytimg.com/vi/{$id}/hqdefault.jpg" : null;
             $videos[$url] = [
                 'title' => trim((string) ($video['title'] ?? '')) ?: 'Video',
                 'url' => $url,
                 'youtube_id' => $id,
-                'thumbnail' => $id ? "https://i.ytimg.com/vi/{$id}/hqdefault.jpg" : null,
+                'thumbnail' => MediaCache::url($thumbnail) ?? $thumbnail,
             ];
         }
 
         return array_values($videos);
+    }
+
+    /**
+     * The software's cover image from the provider, served from the local copy
+     * once the license check has downloaded it. Null when the provider has none.
+     */
+    public function softwareImage(): ?string
+    {
+        $image = $this->last_verification_response['software']['image_url'] ?? null;
+
+        return is_string($image) && $image !== '' ? (MediaCache::url($image) ?? $image) : null;
+    }
+
+    /**
+     * Every provider image worth a local copy: the cover image and the
+     * thumbnails of YouTube videos.
+     *
+     * @return array<int, string>
+     */
+    public function mediaUrls(): array
+    {
+        $software = $this->last_verification_response['software'] ?? null;
+        $urls = [is_array($software) && is_string($software['image_url'] ?? null) ? $software['image_url'] : null];
+        foreach ($this->videos() as $video) {
+            $urls[] = $video['youtube_id'] ? "https://i.ytimg.com/vi/{$video['youtube_id']}/hqdefault.jpg" : null;
+        }
+
+        return array_values(array_filter($urls));
     }
 
     /** youtu.be/ID, youtube.com/watch?v=ID, /embed/ID, /shorts/ID, /live/ID. */

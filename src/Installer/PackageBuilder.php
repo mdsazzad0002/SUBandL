@@ -60,6 +60,9 @@ class PackageBuilder
         '.phpunit.result.cache', '.phpunit.cache',
         'node_modules/.cache', 'node_modules/.vite',
         'public/hot', 'public/storage',
+        // The root .htaccess is each host's own (e.g. rewriting into public/ on
+        // shared hosting). public/.htaccess is Laravel's and stays in.
+        '.htaccess',
         // Packages built before the default moved to installers/.
         'storage/installers',
     ];

@@ -8,6 +8,7 @@ use SUBandL\License\ServerHealth;
 use SUBandL\Models\LicenseState;
 use SUBandL\Support\Access;
 use SUBandL\Support\Assets;
+use SUBandL\Support\MediaCache;
 use SUBandL\Support\UpdateNotice;
 use SUBandL\Update\UpdateApplier;
 
@@ -151,5 +152,15 @@ class WidgetController extends Controller
             'Content-Type' => $type,
             'Cache-Control' => request()->filled('v') ? 'public, max-age=31536000, immutable' : 'no-cache',
         ]);
+    }
+
+    /** A cached provider image; its name is its source URL's hash, so it never changes. */
+    public function media(string $file)
+    {
+        $path = MediaCache::path($file);
+
+        abort_if($path === null, 404);
+
+        return response()->file($path, ['Cache-Control' => 'public, max-age=31536000, immutable']);
     }
 }

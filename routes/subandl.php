@@ -9,6 +9,11 @@ Route::get('/subandl/assets/{file}', [W::class, 'asset'])
     ->where('file', '[a-z]+\.(js|css)')
     ->name('subandl.asset');
 
+// Local copies of the provider's images (see MediaCache).
+Route::get('/subandl/media/{file}', [W::class, 'media'])
+    ->where('file', '[a-f0-9]{40}\\.(jpg|png|webp|gif)')
+    ->name('subandl.media');
+
 Route::get('/license/verification-required', [C::class, 'verificationRequired'])->name('license.verification-required');
 Route::get('/terms', [C::class, 'terms'])->name('license.terms');
 

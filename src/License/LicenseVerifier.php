@@ -6,6 +6,7 @@ use Illuminate\Support\Facades\Log;
 use SUBandL\Events\LicenseVerified;
 use SUBandL\Models\ActivityLog;
 use SUBandL\Models\LicenseState;
+use SUBandL\Support\MediaCache;
 
 /**
  * Single place that performs a live verification against the provider and
@@ -92,6 +93,14 @@ class LicenseVerifier
         $state->last_verification_response = $result['raw'] ?? null;
         $state->last_verification_error = $result['ok'] ? null : ($result['message'] ?? 'Verification failed.');
         $state->save();
+
+        // Local copies of the cover image and thumbnails, so showing them never
+        // reaches the provider. A failed download only leaves the remote URL.
+        try {
+            MediaCache::sync($state->mediaUrls());
+        } catch (\Throwable $e) {
+            report($e);
+        }
 
         // The provider answered for this device + domain: they are the known
         // identity from now on (see IdentityWatch).

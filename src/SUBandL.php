@@ -17,6 +17,7 @@ use SUBandL\Update\UpdateApplier;
  *   SUBandL::module('careflow')['enabled'];
  *   SUBandL::verify(force: true);
  *   SUBandL::videos();                   // tutorial videos from the portal (cached, no HTTP)
+ *   SUBandL::softwareImage();            // the portal's cover image, served locally once cached
  *   SUBandL::update();                   // apply the next pending version, if any
  *   SUBandL::backup(force: true);
  */
@@ -65,6 +66,12 @@ class SUBandL
     public function videos(): array
     {
         return $this->state()->videos();
+    }
+
+    /** The software's cover image from the provider (a local copy once cached), or null. */
+    public function softwareImage(): ?string
+    {
+        return $this->state()->softwareImage();
     }
 
     /**

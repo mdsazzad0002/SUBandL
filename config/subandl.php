@@ -326,7 +326,8 @@ return [
     |--------------------------------------------------------------------------
     | Installer packages (php artisan installergenerate)
     |--------------------------------------------------------------------------
-    | .env, .git, the contents of storage/ and bootstrap/cache are always left out.
+    | .env, .git, the root .htaccess, the contents of storage/ and bootstrap/cache
+    | are always left out.
     */
     'installer' => [
         // In the project root; never packaged itself (add /installers to .gitignore).
