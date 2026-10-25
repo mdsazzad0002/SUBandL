@@ -13,37 +13,45 @@ use ZipArchive;
  * Builds the distributable zips for `php artisan installergenerate`.
  *
  * The project is scanned once; every file is tagged with the optional part
- * it belongs to (node_modules, vendor, frontend sources), and each variant
- * is the same list minus the parts it leaves out. Secrets (.env), VCS data,
- * logs, caches and compiled views never go in.
+ * it belongs to (vendor, frontend sources, uploads, node_modules), and each
+ * variant is the core (app, bootstrap, config, database, public, routes,
+ * views, root files…) plus the parts it includes. Secrets (.env), VCS data
+ * and the contents of storage/ and bootstrap/cache never go in.
  */
 class PackageBuilder
 {
-    public const PART_NODE = 'node';
     public const PART_VENDOR = 'vendor';
     public const PART_ASSETS = 'assets';
+    public const PART_UPLOADS = 'uploads';
+    public const PART_NODE = 'node';
 
-    /** Variant name => the parts it leaves out. */
+    /** Only the folder skeleton (.gitignore files): in every installer, never in an update. */
+    public const PART_RUNTIME = 'runtime';
+
+    public const PARTS = [
+        self::PART_VENDOR => 'vendor',
+        self::PART_ASSETS => 'resources js/css',
+        self::PART_UPLOADS => 'uploads (logo, favicon, documents)',
+        self::PART_NODE => 'node_modules',
+    ];
+
+    /** Variant name => the parts it includes on top of the core. */
     public const VARIANTS = [
-        'full' => [],
-        'no-node' => [self::PART_NODE],
-        'no-vendor' => [self::PART_VENDOR],
-        'no-assets' => [self::PART_ASSETS],
-        'no-node-vendor' => [self::PART_NODE, self::PART_VENDOR],
-        'no-node-assets' => [self::PART_NODE, self::PART_ASSETS],
-        'no-vendor-assets' => [self::PART_VENDOR, self::PART_ASSETS],
-        'minimal' => [self::PART_NODE, self::PART_VENDOR, self::PART_ASSETS],
+        'minimal' => [],
+        'vendor' => [self::PART_VENDOR],
+        'extended' => [self::PART_VENDOR, self::PART_ASSETS],
+        'uploads' => [self::PART_VENDOR, self::PART_ASSETS, self::PART_UPLOADS],
+        'node' => [self::PART_VENDOR, self::PART_ASSETS, self::PART_NODE],
+        'full' => [self::PART_VENDOR, self::PART_ASSETS, self::PART_UPLOADS, self::PART_NODE],
     ];
 
     public const VARIANT_LABELS = [
-        'full' => 'Everything (vendor + node_modules + resources js/css)',
-        'no-node' => 'Without node_modules',
-        'no-vendor' => 'Without vendor',
-        'no-assets' => 'Without resources js/css (prebuilt public assets only)',
-        'no-node-vendor' => 'Without node_modules and vendor',
-        'no-node-assets' => 'Without node_modules and resources js/css',
-        'no-vendor-assets' => 'Without vendor and resources js/css',
-        'minimal' => 'Without node_modules, vendor and resources js/css',
+        'minimal' => 'Minimal: app, config, database, public build, views… (no vendor, js/css, uploads)',
+        'vendor' => 'Minimal + vendor',
+        'extended' => 'Minimal + vendor + resources js/css',
+        'uploads' => 'Extended + uploads (logo, favicon, documents)',
+        'node' => 'Extended + node_modules',
+        'full' => 'Everything: vendor, js/css, uploads and node_modules',
     ];
 
     /** Never packaged. */
@@ -52,11 +60,13 @@ class PackageBuilder
         '.phpunit.result.cache', '.phpunit.cache',
         'node_modules/.cache', 'node_modules/.vite',
         'public/hot', 'public/storage',
+        // Packages built before the default moved to installers/.
+        'storage/installers',
     ];
 
     /**
-     * Kept as empty folders: only their .gitignore files go in. storage/ is
-     * runtime data (logs, sessions, uploads, backups), never part of a release.
+     * Only their .gitignore files go in: storage/ is runtime data (logs,
+     * sessions, backups), never part of a release.
      */
     private const CONTENT_ONLY = [
         'storage',
@@ -67,11 +77,16 @@ class PackageBuilder
 
     private array $exclude;
     private array $assetPaths;
+    private array $uploadPaths;
 
-    public function __construct(private readonly string $root, array $extraExclude = [], array $assetPaths = [])
+    /** The content-only roots and every folder under an upload path, created empty in every installer. */
+    private array $emptyDirs = [];
+
+    public function __construct(private readonly string $root, array $extraExclude = [], array $assetPaths = [], array $uploadPaths = [])
     {
         $this->exclude = array_values(array_filter(array_map([$this, 'normalize'], [...self::EXCLUDE, ...$extraExclude])));
         $this->assetPaths = array_values(array_filter(array_map([$this, 'normalize'], $assetPaths)));
+        $this->uploadPaths = array_values(array_filter(array_map([$this, 'normalize'], $uploadPaths)));
     }
 
     /**
@@ -97,9 +112,21 @@ class PackageBuilder
         });
 
         $files = [];
-        foreach (new RecursiveIteratorIterator($filter) as $file) {
+        $this->emptyDirs = array_values(array_filter(
+            [...self::CONTENT_ONLY, ...$this->uploadPaths],
+            fn ($dir) => is_dir($root . '/' . $dir)
+        ));
+        foreach (new RecursiveIteratorIterator($filter, RecursiveIteratorIterator::SELF_FIRST) as $file) {
             /** @var SplFileInfo $file */
             $rel = $this->relative($root, $file->getPathname());
+            if ($file->isDir()) {
+                // Upload code often expects its folder (uploads/employee/documents) to exist.
+                if ($this->under($rel, $this->uploadPaths)) {
+                    $this->emptyDirs[] = $rel;
+                }
+
+                continue;
+            }
             $files[] = [
                 'abs' => $file->getPathname(),
                 'rel' => $rel,
@@ -114,13 +141,92 @@ class PackageBuilder
     }
 
     /**
+     * What an update compares: the core, vendor and the frontend sources —
+     * never uploads, node_modules or storage.
+     *
+     * @return array<string, array{0: string, 1: int}>  path => [crc32, size]
+     */
+    public function fingerprints(array $files): array
+    {
+        $prints = [];
+        foreach ($files as $file) {
+            if (in_array($file['part'], [null, self::PART_VENDOR, self::PART_ASSETS], true) && is_file($file['abs'])) {
+                $prints[$file['rel']] = [hash_file('crc32b', $file['abs']), (int) filesize($file['abs'])];
+            }
+        }
+
+        return $prints;
+    }
+
+    /**
+     * Files to ship in an update from $baseline, and the ones to delete.
+     * vendor/ is compared file by file when the baseline has it; otherwise
+     * it goes in whole only when composer.lock changed.
+     *
+     * @param  array<string, array{0: string, 1: int}>  $current
+     * @param  array<string, array{0: string, 1: int}>  $baseline
+     * @return array{changed: list<string>, removed: list<string>, vendor: string}
+     */
+    public function diff(array $current, array $baseline, bool $withAssets, array $ignore = []): array
+    {
+        $baselineHasVendor = false;
+        foreach ($baseline as $rel => $_) {
+            if (str_starts_with($rel, 'vendor/')) {
+                $baselineHasVendor = true;
+
+                break;
+            }
+        }
+        $lockChanged = ($current['composer.lock'] ?? null) !== ($baseline['composer.lock'] ?? null);
+        $vendor = $baselineHasVendor ? 'compared' : ($lockChanged ? 'composer.lock changed' : 'unchanged');
+
+        $considered = function (string $rel) use ($withAssets, $baselineHasVendor, $ignore): bool {
+            if (in_array($rel, $ignore, true)) {
+                return false;
+            }
+
+            return match ($this->partOf($rel)) {
+                null => true,
+                self::PART_VENDOR => $baselineHasVendor,
+                self::PART_ASSETS => $withAssets,
+                default => false,
+            };
+        };
+
+        $changed = [];
+        foreach ($current as $rel => $print) {
+            $isVendor = str_starts_with($rel, 'vendor/');
+            if ($isVendor && ! $baselineHasVendor) {
+                if ($lockChanged) {
+                    $changed[] = $rel;
+                }
+
+                continue;
+            }
+            if ($considered($rel) && ($baseline[$rel] ?? null) !== $print) {
+                $changed[] = $rel;
+            }
+        }
+
+        $removed = [];
+        foreach ($baseline as $rel => $_) {
+            // Only what the project really dropped; an excluded file that still exists stays put.
+            if (! isset($current[$rel]) && $considered($rel) && ! file_exists($this->root . '/' . $rel)) {
+                $removed[] = $rel;
+            }
+        }
+
+        return ['changed' => $changed, 'removed' => $removed, 'vendor' => $vendor];
+    }
+
+    /**
      * @param  list<array{abs: string, rel: string, part: ?string, exec: bool}>  $files
-     * @param  list<string>  $leaveOut  parts to leave out
+     * @param  list<string>  $include  optional parts to include
      * @param  array<string, string>  $extraFiles  zip path => absolute source file
      * @param  array<string, string>  $extraStrings  zip path => contents
      * @return array{ok: bool, files?: int, message?: string}
      */
-    public function build(string $zipPath, array $files, array $leaveOut, array $extraFiles = [], array $extraStrings = [], ?callable $progress = null, bool $retry = true): array
+    public function build(string $zipPath, array $files, array $include, array $extraFiles = [], array $extraStrings = [], ?callable $progress = null, bool $skeleton = true, bool $retry = true): array
     {
         $tmp = $zipPath . '.part';
         @unlink($tmp);
@@ -132,7 +238,8 @@ class PackageBuilder
 
         $count = 0;
         foreach ($files as $file) {
-            if ($file['part'] !== null && in_array($file['part'], $leaveOut, true)) {
+            $part = $file['part'];
+            if ($part !== null && ! ($part === self::PART_RUNTIME ? $skeleton : in_array($part, $include, true))) {
                 continue;
             }
             if (isset($extraFiles[$file['rel']]) || isset($extraStrings[$file['rel']])) {
@@ -145,8 +252,8 @@ class PackageBuilder
             $count++;
         }
 
-        foreach (self::CONTENT_ONLY as $dir) {
-            if (is_dir($this->root . '/' . $dir)) {
+        if ($skeleton) {
+            foreach ($this->emptyDirs as $dir) {
                 $zip->addEmptyDir($dir);
             }
         }
@@ -177,7 +284,7 @@ class PackageBuilder
             // A file deleted while zipping (a cache the running app prunes): once more without it.
             $present = array_values(array_filter($files, fn ($file) => is_file($file['abs'])));
             if ($retry && count($present) < count($files)) {
-                return $this->build($zipPath, $present, $leaveOut, $extraFiles, $extraStrings, $progress, false);
+                return $this->build($zipPath, $present, $include, $extraFiles, $extraStrings, $progress, $skeleton, false);
             }
 
             return ['ok' => false, 'message' => "Writing '{$zipPath}' failed: {$error}"];
@@ -204,13 +311,7 @@ class PackageBuilder
             return false;
         }
 
-        foreach (self::CONTENT_ONLY as $dir) {
-            if (str_starts_with($rel, $dir . '/')) {
-                return $name === '.gitignore';
-            }
-        }
-
-        return true;
+        return ! $this->under($rel, self::CONTENT_ONLY) || $name === '.gitignore';
     }
 
     private function isExcluded(string $rel): bool
@@ -226,19 +327,25 @@ class PackageBuilder
 
     private function partOf(string $rel): ?string
     {
-        if (str_starts_with($rel, 'node_modules/')) {
-            return self::PART_NODE;
-        }
-        if (str_starts_with($rel, 'vendor/')) {
-            return self::PART_VENDOR;
-        }
-        foreach ($this->assetPaths as $path) {
-            if ($rel === $path || str_starts_with($rel, $path . '/')) {
-                return self::PART_ASSETS;
+        return match (true) {
+            str_starts_with($rel, 'node_modules/') => self::PART_NODE,
+            str_starts_with($rel, 'vendor/') => self::PART_VENDOR,
+            $this->under($rel, self::CONTENT_ONLY) => self::PART_RUNTIME,
+            $this->under($rel, $this->uploadPaths) => self::PART_UPLOADS,
+            $this->under($rel, $this->assetPaths) => self::PART_ASSETS,
+            default => null,
+        };
+    }
+
+    private function under(string $rel, array $paths): bool
+    {
+        foreach ($paths as $path) {
+            if (str_starts_with($rel, $path . '/')) {
+                return true;
             }
         }
 
-        return null;
+        return false;
     }
 
     private function relative(string $root, string $path): string

@@ -329,10 +329,14 @@ return [
     | .env, .git, the contents of storage/ and bootstrap/cache are always left out.
     */
     'installer' => [
-        'output_path' => storage_path('installers'),
-        // What the "no-assets" variants leave out (the built public/ files stay).
+        // In the project root; never packaged itself (add /installers to .gitignore).
+        'output_path' => base_path('installers'),
+        // The frontend sources only the extended / node / full packages carry (public/build is always in).
         'asset_paths' => ['resources/js', 'resources/css'],
-        // Extra paths (relative to the project root) never packaged, e.g. 'public/uploads'.
+        // Customer files (logo, favicon, employee documents…): only the
+        // uploads / full packages carry them; the others get the folders empty.
+        'upload_paths' => ['public/uploads'],
+        // Extra paths (relative to the project root) never packaged at all.
         'exclude' => [],
         // Where the database file goes inside the zip (.sqlite for SQLite).
         'database_path' => 'database/installer/database.sql',

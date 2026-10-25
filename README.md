@@ -254,30 +254,44 @@ To restyle the Blade pages: `php artisan vendor:publish --tag=subandl-views`.
 
 ## Installer packages
 
-`php artisan installergenerate` packages the project into zips you can hand to a new customer. It asks for the version, the variants and the database mode, or takes them as options:
+`php artisan installergenerate` packages the project into zips you can hand to a new customer, and builds update zips for the next version. It asks for the version, the packages and the database mode, or takes them as options:
 
 ```bash
 php artisan installergenerate --release=1.9.0 --all --db=fresh
-php artisan installergenerate --release=1.9.0 --variant=full --variant=no-vendor --db=none
+php artisan installergenerate --release=1.9.0 --variant=minimal --variant=vendor --db=none
+php artisan installergenerate --release=1.9.0 --with=vendor --with=uploads         # custom: minimal-vendor-uploads
+php artisan installergenerate --release=1.9.0 --update-only --update-from=1.8.9     # update package only
 ```
 
-| Variant | Leaves out |
-|---|---|
-| `full` | nothing |
-| `no-node` | `node_modules/` |
-| `no-vendor` | `vendor/` |
-| `no-assets` | `resources/js`, `resources/css` (the built `public/build` stays) |
-| `no-node-vendor`, `no-node-assets`, `no-vendor-assets` | both parts |
-| `minimal` | all three |
+**Minimal** is the core: `app`, `bootstrap`, `config`, `database`, `docs`, `public` (with the built assets), `resources` without `js`/`css`, `routes`, the empty `storage` skeleton, `.env.example` and the root files. Every other variant adds parts to it:
 
-| `--db` | Database in the zip |
+| Variant | vendor | resources js/css | uploads | node_modules |
+|---|:-:|:-:|:-:|:-:|
+| `minimal` | | | | |
+| `vendor` | ✓ | | | |
+| `extended` | ✓ | ✓ | | |
+| `uploads` | ✓ | ✓ | ✓ | |
+| `node` | ✓ | ✓ | | ✓ |
+| `full` | ✓ | ✓ | ✓ | ✓ |
+
+`--with=vendor|assets|uploads|node` (repeatable) builds any other combination, named `minimal-<parts>`. Uploads (`public/uploads`: logo, favicon, employee documents) are customer files: without the `uploads` part only their empty folders go in.
+
+| `--db` | Database in the installers |
 |---|---|
 | `fresh` (default) | Migrations and seeders (`--no-seed` to skip them) run into a scratch database, which is dumped and dropped. The project database is never touched. If the DB user can't create databases, pass an empty one with `--fresh-database=name`; otherwise it falls back to `schema`. |
 | `schema` | The current structure without data, except the `migrations` rows |
 | `current` | The current database with all its data |
 | `none` | No database |
 
-The database goes in at `database/installer/database.sql`. Every zip also holds an `INSTALL.txt` with the steps for that variant, an `installer.json` and a `.env.example` with `APP_VERSION` set. `.env`, `.git`, the contents of `storage/` (only its folder skeleton goes in), `bootstrap/cache` and symlinks are never packaged. The zips and a `SHA256SUMS.txt` go to `storage/installers/<version>/`. Paths and extra exclusions (such as `public/uploads`) are under `installer` in the config.
+The database goes in at `database/installer/database.sql`. Every installer also holds an `INSTALL.txt` with the steps for that variant, an `installer.json` and a `.env.example` with `APP_VERSION` set. `.env`, `.git`, `bootstrap/cache`, symlinks, `subandl-remove.txt` and the files in `storage/` are never packaged.
+
+### Update packages
+
+`--update-from=<version>` compares the project with an earlier build and zips only the files that changed (in the [release package format](#release-package-format-for-the-portal)), with a `subandl-remove.txt` listing the deleted ones. `vendor/` goes in only when it changed: file by file when the earlier build had vendor, otherwise all of it when `composer.lock` changed. Uploads, `node_modules`, `storage/` and the database are never in an update; the updater runs the migrations.
+
+Each build writes `manifest.json` next to its zips for the next update to compare with. `--update-from` also takes the path of an earlier installer zip or `manifest.json`.
+
+Everything goes to `installers/<version>/` in the project root (add `/installers` to `.gitignore`), with a `SHA256SUMS.txt` (use it as the update's `checksum`). The folder itself is never packaged. Paths are under `installer` in the config.
 
 ## Release package format (for the portal)
 
