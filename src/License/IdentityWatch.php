@@ -104,6 +104,12 @@ class IdentityWatch
         return self::domain(InstallationIdentity::current()->domain);
     }
 
+    /** Where the install is bound, as stored — a public domain, or a local host such as 127.0.0.1. */
+    public static function boundHost(): ?string
+    {
+        return InstallationIdentity::current()->domain ?: null;
+    }
+
     /**
      * Why this install looks like a copy, or null. Worked out once per
      * request (or console run).
@@ -210,7 +216,9 @@ class IdentityWatch
 
     /**
      * A new license key was just accepted: this install now belongs where it
-     * runs — this device, and this public domain (none when browsed locally).
+     * runs — this device, and the host it is browsed on. A local host
+     * (localhost, 127.0.0.1) replaces a live domain from before; domain()
+     * still reads it as local, so it is never enforced or sent as a domain.
      */
     public function rebind(Request $request): void
     {
@@ -218,9 +226,11 @@ class IdentityWatch
             return;
         }
 
+        $host = strtolower($request->getHost());
+
         InstallationIdentity::current()->forceFill([
             'fingerprint' => self::device(),
-            'domain' => self::domain($request->getHost()),
+            'domain' => self::domain($host) ?? ($host !== '' ? $host : null),
         ])->save();
 
         self::$tamperChecked = false;

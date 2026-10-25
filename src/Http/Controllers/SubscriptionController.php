@@ -543,7 +543,8 @@ class SubscriptionController extends Controller
 
         return [
             'device_id' => $payload['device_id'],
-            'domain' => $payload['domain'],
+            // The public domain sent to the provider, else the local host it is bound to.
+            'domain' => $payload['domain'] ?? IdentityWatch::boundHost(),
             'environment' => IdentityWatch::environment(),
             'device_serial' => DeviceSerial::get(),
         ];

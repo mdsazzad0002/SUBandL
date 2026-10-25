@@ -30,7 +30,7 @@ class StatusCommand extends Command
             ['Version', config('subandl.version')],
             ['Device ID', InstallationIdentity::current()->installation_uuid],
             ['Device serial', DeviceSerial::get() ?? 'unavailable (host name + folder used)'],
-            ['Licensed domain', IdentityWatch::knownDomain() ?? 'not bound yet'],
+            ['Licensed domain', IdentityWatch::boundHost() ?? 'not bound yet'],
             ['Tamper', IdentityWatch::tamperReason() ?? 'none (browser-side check runs per request)'],
             ['License key', $key === '' ? '-' : substr($key, 0, 4) . str_repeat('*', max(0, strlen($key) - 8)) . substr($key, -4)],
             ['Status', $state->status . ($state->isUsable() ? ' (usable)' : ' (NOT usable)')],
