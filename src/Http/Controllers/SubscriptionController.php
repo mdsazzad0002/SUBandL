@@ -109,20 +109,30 @@ class SubscriptionController extends Controller
 
         $key = trim($request->input('license'));
         $state = LicenseState::current();
+        $keyChanged = $state->license_key !== $key;
 
-        if ($state->license_key !== $key) {
+        if ($keyChanged) {
             $state->domain = null;
         }
 
         $state->license_key = $key;
         $state->save();
 
+        $checkedFrom = now()->startOfSecond();
         $state = $verifier->refresh(force: true);
+
+        // A different key the provider has just accepted licenses this install
+        // afresh: bind it to where it runs now, not to where the previous key
+        // was used. The same key again never clears tampering.
+        $verifiedNow = $state->last_verified_at && $state->last_verified_at->gte($checkedFrom);
+        if ($keyChanged && $verifiedNow && $state->status === 'active') {
+            app(IdentityWatch::class)->rebind($request);
+        }
 
         if (! $state->isUsable()) {
             return response()->json([
                 'status' => false,
-                'message' => $state->last_verification_error ?? 'License could not be verified.',
+                'message' => IdentityWatch::tamperReason() ?? $state->last_verification_error ?? 'License could not be verified.',
             ], 422);
         }
 

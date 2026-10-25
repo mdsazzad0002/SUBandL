@@ -208,6 +208,24 @@ class IdentityWatch
         ]))->save();
     }
 
+    /**
+     * A new license key was just accepted: this install now belongs where it
+     * runs — this device, and this public domain (none when browsed locally).
+     */
+    public function rebind(Request $request): void
+    {
+        if (! self::ready()) {
+            return;
+        }
+
+        InstallationIdentity::current()->forceFill([
+            'fingerprint' => self::device(),
+            'domain' => self::domain($request->getHost()),
+        ])->save();
+
+        self::$tamperChecked = false;
+    }
+
     private static function browserRequest(): ?Request
     {
         return app()->runningInConsole() ? null : request();
