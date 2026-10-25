@@ -484,6 +484,9 @@ class SubscriptionController extends Controller
         return [
             'status' => $state->status,
             'license_key' => $state->license_key,
+            // Exactly what every check sends as the binding. /license/status is
+            // public, so only users with license access get it.
+            ...(Access::allows('license') ? $this->identity() : []),
             'needs_subscription_redirect' => $state->needsSubscriptionRedirect(),
             'subscription_type' => $state->subscription_type,
             'client_name' => $state->client_name,
@@ -519,6 +522,14 @@ class SubscriptionController extends Controller
             'next_update_check_at' => $this->nextDueAt($state->last_update_check_at, (int) config('subandl.update_check_hours', 2) * 60)->toDateTimeString(),
             'next_backup_at' => $backups->nextDueAt($state)->toDateTimeString(),
         ];
+    }
+
+    /** @return array{device_id: string, domain: ?string} */
+    private function identity(): array
+    {
+        $payload = app(LicenseClient::class)->identityPayload();
+
+        return ['device_id' => $payload['device_id'], 'domain' => $payload['domain']];
     }
 
     /**

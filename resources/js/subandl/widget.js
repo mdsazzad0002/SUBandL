@@ -302,6 +302,11 @@ function renderLicense() {
                 <button class="sbw-btn" type="submit" ${busy ? 'disabled' : ''}>${busy === 'license' ? 'Verifying…' : 'Save &amp; verify'}</button>
                 <button class="sbw-btn sbw-ghost" type="button" data-sbw="refresh-license" ${busy ? 'disabled' : ''}>Refresh</button>
             </form>
+            ${status.device_id ? `
+            <div class="sbw-box">
+                <p class="sbw-kv"><span>Device ID</span><span class="sbw-code">${esc(status.device_id)}</span></p>
+                <p class="sbw-kv"><span>Domain</span><span class="sbw-code">${esc(status.domain || 'Not bound (localhost / IP)')}</span></p>
+            </div>` : ''}
             <p class="sbw-muted">By using this software you agree to the <a href="${esc(state.urls.terms)}">terms</a>.</p>
         </section>`;
 }
