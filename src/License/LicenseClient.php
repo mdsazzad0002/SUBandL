@@ -6,6 +6,7 @@ use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\PendingRequest;
 use SUBandL\Models\ActivityLog;
 use SUBandL\Models\LicenseState;
+use SUBandL\Support\DeviceSerial;
 use SUBandL\Support\HttpClient;
 
 /**
@@ -181,6 +182,9 @@ class LicenseClient
             // This machine (a hash of its serial, see IdentityWatch::device()),
             // for a provider that binds the device as well as the device_id.
             'device_fingerprint' => IdentityWatch::device(),
+            // The serial itself, as the License page shows it: the provider binds
+            // a local install to it (a live one to its domain).
+            'device_serial' => DeviceSerial::get(),
             'environment' => IdentityWatch::environment(),
             // 2 = understands billing summaries and locked update previews.
             'api_version' => 2,
