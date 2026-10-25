@@ -97,6 +97,17 @@ class LicenseVerifier
         // identity from now on (see IdentityWatch).
         app(IdentityWatch::class)->remember(request());
 
+        // The provider accepted this machine as a local installation (the license
+        // was revoked and re-bound to "localhost" there): a live domain left in a
+        // database copied from the live site is no longer this install's binding.
+        $providerDomain = is_array($result['raw'] ?? null) ? ($result['raw']['domain'] ?? null) : null;
+        if ($result['ok'] && is_string($providerDomain) && $providerDomain !== ''
+            && IdentityWatch::domain($providerDomain) === null
+            && ! app()->runningInConsole() && IdentityWatch::isLocal(request()->getHost())
+            && IdentityWatch::knownDomain() !== null) {
+            app(IdentityWatch::class)->rebind(request());
+        }
+
         ActivityLog::record('license', $result['ok'], $result['ok']
             ? "License verified: {$state->status}."
             : "License check answered: {$state->status}" . ($state->last_verification_error ? " — {$state->last_verification_error}" : '') . '.');
