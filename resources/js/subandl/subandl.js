@@ -26,6 +26,39 @@ export function fmt(value) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** The update stages in order, as the server reports them (see UpdateProgress.php). */
+export const UPDATE_STAGES = [
+    ['check', 'Check'],
+    ['backup', 'Backup'],
+    ['download', 'Download'],
+    ['merge', 'Merge files'],
+    ['migrate', 'Migrate'],
+];
+
+/**
+ * The server's progress snapshot as a list of
+ * { key, label, status: pending|running|done|skipped|failed, percent, detail }.
+ * Without a snapshot every stage is pending.
+ */
+export function updateStages(progress) {
+    const stages = (progress && progress.stages) || {};
+    return UPDATE_STAGES.map(([key, label]) => ({
+        key,
+        label,
+        status: 'pending',
+        percent: 0,
+        detail: null,
+        ...(stages[key] || {}),
+    }));
+}
+
+/** One line for UIs without bars: "Download 45% — 3.2 MB of 7.0 MB". */
+export function progressText(progress) {
+    const stage = updateStages(progress).find((s) => s.key === (progress && progress.current)) || null;
+    if (!stage) return 'Updating… do not close this page.';
+    return `${stage.label} ${stage.percent}%` + (stage.detail ? ' — ' + stage.detail : '');
+}
+
 function csrfHeaders() {
     const meta = typeof document !== 'undefined' && document.querySelector('meta[name="csrf-token"]');
     if (meta && meta.content) {
@@ -72,13 +105,38 @@ export function createSubandl({ base = '' } = {}) {
     }
 
     /** Polls `path` every 5s until `data[flag]` turns false (max 30 min). */
-    async function waitUntilDone(path, flag) {
+    async function waitUntilDone(path, flag, onPoll = () => {}) {
         for (let i = 0; i < 360; i++) {
             await sleep(5000);
             const r = await request('GET', path);
+            if (r.ok) onPoll(r.data);
             if (r.ok && !r.data[flag]) return r.data;
         }
         return null;
+    }
+
+    /**
+     * Reads the live stage progress every 700ms while an update request is
+     * open; returns stop(). Laravel sessions don't lock, so this runs beside it.
+     */
+    function watchProgress(run, onTick) {
+        let stopped = false;
+        (async () => {
+            while (!stopped) {
+                await sleep(700);
+                if (stopped) break;
+                const r = await request('GET', '/license/update/status');
+                if (!stopped && r.ok && r.data.progress && r.data.progress.run === run) onTick(r.data.progress);
+            }
+        })();
+        return () => {
+            stopped = true;
+        };
+    }
+
+    async function latestProgress(run) {
+        const r = await request('GET', '/license/update/status');
+        return (r.ok && r.data.progress && r.data.progress.run === run && r.data.progress) || null;
     }
 
     return {
@@ -106,15 +164,24 @@ export function createSubandl({ base = '' } = {}) {
 
         /**
          * Applies updates one version step at a time until none is left.
-         * onProgress receives { message, version } after each step.
-         * @returns {Promise<{ ok: boolean, message: string, version?: string }>}
+         * onProgress receives { message, step, progress } while a step runs —
+         * progress is the server's per-stage snapshot (see updateStages()) —
+         * and { message, version, step, progress } after each step.
+         * @returns {Promise<{ ok: boolean, message: string, version?: string, progress?: object }>}
          */
         async runUpdate(onProgress = () => {}) {
             let last = { ok: true, message: 'No update available.' };
 
             for (let step = 0; step < 20; step++) {
-                onProgress({ message: 'Updating… do not close this page.' });
-                const r = await request('POST', '/license/update/run');
+                const tick = (progress) => onProgress({ message: progressText(progress), step: step + 1, progress });
+                onProgress({ message: 'Updating… do not close this page.', step: step + 1, progress: null });
+
+                // Tags this step's snapshot, so a poll never shows the last step's.
+                const run = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+                const stop = watchProgress(run, tick);
+                const r = await request('POST', '/license/update/run', { run });
+                stop();
+                const progress = await latestProgress(run);
 
                 if (r.status === 409) {
                     return { ok: false, message: r.data.message || 'An update is already running.' };
@@ -123,28 +190,29 @@ export function createSubandl({ base = '' } = {}) {
                 // Provider unreachable (retry later) or update not included in the plan:
                 // a definite answer, nothing is running in the background.
                 if (r.status === 503 && r.data.retry_at !== undefined) {
-                    return { ok: false, message: r.data.message, retryAt: r.data.retry_at };
+                    return { ok: false, message: r.data.message, retryAt: r.data.retry_at, progress };
                 }
                 if (r.status === 402) {
-                    return { ok: false, locked: true, message: r.data.message };
+                    return { ok: false, locked: true, message: r.data.message, progress };
                 }
 
                 // The request died (proxy/worker timeout) — the step may still finish.
                 if (!r.ok && (r.status === 0 || r.status >= 500)) {
-                    onProgress({ message: 'Waiting for the update to finish…' });
-                    const st = await waitUntilDone('/license/update/status', 'running');
+                    onProgress({ message: 'Waiting for the update to finish…', step: step + 1, progress });
+                    const st = await waitUntilDone('/license/update/status', 'running', (d) => d.progress && d.progress.run === run && tick(d.progress));
                     return {
                         ok: !!st && st.last_update_status === 'success',
                         message: (st && st.last_update_message) || 'The update request was interrupted.',
                         version: st && st.version,
+                        progress: st && st.progress,
                     };
                 }
 
                 if (!r.data.status) {
-                    return { ok: false, message: r.data.message || 'Update failed.' };
+                    return { ok: false, message: r.data.message || 'Update failed.', progress };
                 }
 
-                last = { ok: true, message: r.data.message, version: r.data.version };
+                last = { ok: true, message: r.data.message, version: r.data.version, step: step + 1, progress, more: !!r.data.update_available };
                 onProgress(last);
 
                 if (!r.data.update_available) break;

@@ -24,9 +24,13 @@ use SUBandL\Support\DeviceSerial;
 use SUBandL\Support\Platform;
 use SUBandL\Support\UpdateNotice;
 use SUBandL\Update\UpdateApplier;
+use SUBandL\Update\UpdateProgress;
 
 class SubscriptionController extends Controller
 {
+    /** The provider's answer for the version a finished step moved to. */
+    private const NEXT_UPDATE_KEY = 'subandl:update-next';
+
     /* ------------------------------------------------------------------ pages */
 
     public function verificationRequired()
@@ -308,9 +312,14 @@ class SubscriptionController extends Controller
     /**
      * Applies exactly ONE version step per call and reports whether another is
      * available, so the frontend drives a multi-version upgrade step by step
-     * instead of one long request that can die mid-chain.
+     * instead of one long request that can die mid-chain. Each stage's live
+     * percentage is published through UpdateProgress (read by updateStatus).
+     *
+     * Avoids repeat round trips: a provider probe that succeeded within the
+     * last minute (the modal's preflight) is not repeated, and the "is there
+     * a next version?" answer from the end of one step feeds the next one.
      */
-    public function runUpdate(LicenseClient $client, UpdateApplier $applier)
+    public function runUpdate(Request $request, LicenseClient $client, UpdateApplier $applier)
     {
         if ($denied = $this->denyUnless('update') ?? $this->denyWithoutLicense()) {
             return $denied;
@@ -329,11 +338,20 @@ class SubscriptionController extends Controller
         Platform::allowLongRunning();
 
         $fromVersion = (string) config('subandl.version', '1.0.0');
+        $run = $request->input('run');
+        UpdateProgress::start($fromVersion, null, is_string($run) ? mb_substr($run, 0, 40) : null);
 
         try {
             // Health-check the provider before touching files or the database.
-            $probe = app(ServerHealth::class)->probe(task: 'update');
+            UpdateProgress::stage('check', 10, 'Contacting the update server…');
+            $health = app(ServerHealth::class);
+            $recent = $health->lastProbe();
+            $probe = $recent && $recent['ok'] && now()->diffInSeconds(Carbon::parse($recent['at']), true) < 60
+                ? ['ok' => true]
+                : $health->probe(task: 'update');
             if (! $probe['ok']) {
+                UpdateProgress::fail('check', $probe['message']);
+
                 return response()->json([
                     'status' => false,
                     'extracted' => false,
@@ -343,9 +361,15 @@ class SubscriptionController extends Controller
                 ], 503);
             }
 
-            $result = $client->checkForUpdate($fromVersion);
+            UpdateProgress::stage('check', 50, 'Looking for the next version…');
+            $cached = Cache::pull(self::NEXT_UPDATE_KEY);
+            $result = is_array($cached) && ($cached['from'] ?? null) === $fromVersion
+                ? $cached['result']
+                : $client->checkForUpdate($fromVersion);
 
             if ($result['locked'] ?? false) {
+                UpdateProgress::fail('check', 'Needs the monthly update subscription.');
+
                 return response()->json([
                     'status' => false,
                     'locked' => true,
@@ -356,6 +380,10 @@ class SubscriptionController extends Controller
             }
 
             if (! ($result['ok'] ?? false) || ! ($result['update_available'] ?? false)) {
+                ($result['ok'] ?? false)
+                    ? UpdateProgress::done('check', 'Already up to date.')
+                    : UpdateProgress::fail('check', $result['message'] ?? 'The update check failed.');
+
                 return response()->json([
                     'status' => true,
                     'extracted' => false,
@@ -365,6 +393,7 @@ class SubscriptionController extends Controller
                 ]);
             }
 
+            UpdateProgress::done('check', 'v' . $result['latest_version'] . ' found.');
             $applied = $applier->downloadAndApply($result);
             $stepToVersion = $applied['version'] ?? $result['latest_version'] ?? null;
 
@@ -380,6 +409,11 @@ class SubscriptionController extends Controller
 
             $next = $client->checkForUpdate((string) $stepToVersion);
             $updateAvailable = ($next['ok'] ?? false) && ($next['update_available'] ?? false);
+            if ($updateAvailable) {
+                // Short-lived: download URLs may be signed.
+                unset($next['raw']);
+                Cache::put(self::NEXT_UPDATE_KEY, ['from' => (string) $stepToVersion, 'result' => $next], now()->addMinutes(2));
+            }
 
             return response()->json([
                 'status' => true,
@@ -418,6 +452,7 @@ class SubscriptionController extends Controller
             'last_update_status' => $state->last_update_status,
             'last_update_message' => $state->last_update_message,
             'version' => config('subandl.version', '1.0.0'),
+            'progress' => UpdateProgress::get(),
         ]);
     }
 
