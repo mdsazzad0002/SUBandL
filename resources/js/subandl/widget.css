@@ -182,19 +182,46 @@ html.sbw-noscroll, html.sbw-noscroll body { overflow: hidden !important; }
 .sbw-btn-lg { padding: 10px 20px; font-size: 14px; }
 .sbw-btn-sm { padding: 6px 12px; font-size: 12.5px; }
 
-/* Update stepper */
-.sbw-steps { display: flex; gap: 6px; list-style: none; margin: 6px 0 12px; padding: 0; counter-reset: s; }
-.sbw-steps li { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: var(--sbw-muted); text-align: center; }
-.sbw-step-dot {
-    display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 50%;
-    border: 2px solid var(--sbw-line); background: var(--sbw-bg); font-size: 12px; font-weight: 700;
+/* Update stages: one bar + percentage per stage */
+.sbw-stages-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin: 4px 0 10px; font-size: 13px; color: var(--sbw-muted); }
+.sbw-stages-head strong { font-size: 18px; color: var(--sbw-text); font-variant-numeric: tabular-nums; }
+.sbw-stages { display: grid; gap: 10px; list-style: none; margin: 0 0 14px; padding: 0; }
+.sbw-stage { padding: 10px 12px; border: 1px solid var(--sbw-line); border-radius: 12px; background: var(--sbw-bg); }
+.sbw-stage-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; font-size: 13px; font-weight: 600; }
+.sbw-stage-label { flex: 1; }
+.sbw-stage-pct { font-variant-numeric: tabular-nums; color: var(--sbw-muted); }
+.sbw-stage-dot {
+    display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; width: 22px; height: 22px; border-radius: 50%;
+    border: 2px solid var(--sbw-line); background: var(--sbw-bg); color: var(--sbw-muted); font-size: 11px; font-weight: 700;
 }
-.sbw-step-now { color: var(--sbw-primary); }
-.sbw-step-now .sbw-step-dot { border-color: var(--sbw-primary); color: var(--sbw-primary); box-shadow: 0 0 0 4px var(--sbw-info-bg); }
-.sbw-step-done { color: var(--sbw-ok); }
-.sbw-step-done .sbw-step-dot { border-color: var(--sbw-ok); background: var(--sbw-ok); color: #fff; }
-.sbw-progress { position: relative; height: 6px; margin: 0 0 12px; overflow: hidden; border-radius: 99px; background: var(--sbw-soft); }
-.sbw-progress span { position: absolute; inset: 0 auto 0 0; width: 40%; border-radius: 99px; background: linear-gradient(90deg, #2563eb, #7c3aed); animation: sbw-slide 1.3s ease-in-out infinite; }
+.sbw-stage-detail { min-height: 1.4em; margin: 6px 0 0; overflow: hidden; font-size: 12px; line-height: 1.4; color: var(--sbw-muted); white-space: nowrap; text-overflow: ellipsis; }
+.sbw-stage-failed .sbw-stage-detail { white-space: normal; overflow-wrap: anywhere; }
+.sbw-bar { position: relative; height: 6px; overflow: hidden; border-radius: 99px; background: var(--sbw-soft); }
+.sbw-bar span { position: absolute; inset: 0 auto 0 0; border-radius: 99px; background: var(--sbw-line); transition: width .7s linear; }
+/* Overall bar: what the whole step has done, above the per-stage rows */
+.sbw-bar-overall { height: 10px; margin: 0 0 14px; }
+.sbw-bar-overall span { background: linear-gradient(90deg, #2563eb, #7c3aed); }
+.sbw-bar-overall.sbw-bar-failed span { background: var(--sbw-bad); }
+/* Running, but nothing measurable yet: a sliding stripe instead of a bar stuck at 0% */
+.sbw-bar-busy span { width: 35% !important; transition: none; animation: sbw-busy 1.2s ease-in-out infinite; }
+
+.sbw-stage-pending { opacity: .6; }
+.sbw-stage-running { border-color: var(--sbw-primary); box-shadow: 0 0 0 3px var(--sbw-info-bg); }
+.sbw-stage-running .sbw-stage-dot { border-color: var(--sbw-primary); color: var(--sbw-primary); }
+.sbw-stage-running .sbw-stage-pct { color: var(--sbw-primary); }
+.sbw-stage-running .sbw-bar span { background: linear-gradient(90deg, #2563eb, #7c3aed); }
+.sbw-stage-running .sbw-bar span::after {
+    content: ''; position: absolute; inset: 0; background: linear-gradient(90deg, transparent, rgba(255, 255, 255, .45), transparent);
+    animation: sbw-shine 1.4s ease-in-out infinite;
+}
+.sbw-stage-done .sbw-stage-dot, .sbw-stage-skipped .sbw-stage-dot { border-color: var(--sbw-ok); background: var(--sbw-ok); color: #fff; }
+.sbw-stage-done .sbw-stage-pct { color: var(--sbw-ok); }
+.sbw-stage-done .sbw-bar span { background: var(--sbw-ok); }
+.sbw-stage-skipped .sbw-bar span { background: var(--sbw-line); }
+.sbw-stage-failed { border-color: var(--sbw-bad); background: var(--sbw-bad-bg); }
+.sbw-stage-failed .sbw-stage-dot { border-color: var(--sbw-bad); background: var(--sbw-bad); color: #fff; }
+.sbw-stage-failed .sbw-stage-pct, .sbw-stage-failed .sbw-stage-detail { color: var(--sbw-bad); }
+.sbw-stage-failed .sbw-bar span { background: var(--sbw-bad); }
 
 /* Payment: invoices and overdue card */
 .sbw-danger { border-color: var(--sbw-bad); background: var(--sbw-bad-bg); }
@@ -225,7 +252,8 @@ html.sbw-noscroll, html.sbw-noscroll body { overflow: hidden !important; }
 @keyframes sbw-fade { from { opacity: 0; } to { opacity: 1; } }
 @keyframes sbw-pop { from { opacity: 0; transform: translateY(12px) scale(.97); } to { opacity: 1; transform: none; } }
 @keyframes sbw-rise { from { opacity: 0; transform: translate(-50%, 12px); } to { opacity: 1; transform: translate(-50%, 0); } }
-@keyframes sbw-slide { 0% { left: -40%; } 100% { left: 100%; } }
+@keyframes sbw-busy { 0% { left: -35%; } 100% { left: 100%; } }
+@keyframes sbw-shine { 0% { transform: translateX(-100%); } 100% { transform: translateX(100%); } }
 
 /* RTL hosts: dock on the left */
 [dir="rtl"] .sbw-tab { right: auto; left: 0; border-right: 1px solid var(--sbw-line); border-left: 0; border-radius: 0 10px 10px 0; }
@@ -237,5 +265,7 @@ html.sbw-noscroll, html.sbw-noscroll body { overflow: hidden !important; }
 @media (prefers-reduced-motion: reduce) {
     .sbw-panel, .sbw-open .sbw-panel, .sbw-backdrop, .sbw-tab { transition: none; }
     .sbw-modal, .sbw-modal-card, .sbw-banner { animation: none; }
-    .sbw-progress span { animation-duration: 4s; }
+    .sbw-stage-running .sbw-bar span::after { animation: none; }
+    .sbw-bar span { transition: none; }
+    .sbw-bar-busy span { animation-duration: 4s; }
 }

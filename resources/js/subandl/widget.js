@@ -6,7 +6,8 @@
  *                         license status, license key form
  *       Update & Backup — version / update, backup (toggle, run), history
  *   • update modal whenever a newer version is available, to apply it right
- *     there (health check → backup + install → reload), or — for a lifetime
+ *     there (check → backup → download → merge → migrate, each with its own
+ *     progress bar and percentage → reload), or — for a lifetime
  *     plan without the update subscription — to show what it would unlock
  *   • payment reminder modal while money is owed: every reminderMinutes once
  *     payment is late (grace period), every dueReminderHours before that;
@@ -22,7 +23,7 @@
  * "update", optional) or SUBandLWidget.open(tab). Adding `data-subandl-check`
  * also starts a live update check (same as SUBandLWidget.checkUpdate()).
  */
-import { createSubandl, fmt, statusTone, LICENSE_FIELDS } from './subandl.js';
+import { createSubandl, fmt, statusTone, updateStages, LICENSE_FIELDS } from './subandl.js';
 
 const script = document.getElementById('subandl-widget');
 const cfg = (() => {
@@ -50,7 +51,9 @@ let status = null; // /license/status, loaded when the panel opens
 let history = null; // merged update + backup history, loaded on the update tab
 let licenseDraft = null;
 let modalDismissedFor = null;
-let updateStep = null; // null | 'check' | 'install' | 'done' while the update modal runs
+let updateStep = null; // null | 'running' | 'failed' | 'done' once the update modal starts
+let liveProgress = null; // the server's per-stage snapshot of the version step in flight
+let liveStepNo = 1; // which version step (multi-version upgrades run one per request)
 let flash = null; // { tone, text }
 
 /* ------------------------------------------------------------------ utils */
@@ -486,25 +489,110 @@ function changelogHtml(u) {
         : `<p class="sbw-pre">${esc(u.changelog)}</p>`;
 }
 
-const UPDATE_STEPS = [
-    ['check', 'Check server'],
-    ['install', 'Back up & install'],
-    ['done', 'Done'],
-];
+const STAGE_STATUS = { done: 'Done', skipped: 'Skipped', failed: 'Failed' };
 
-function stepperHtml() {
-    const at = UPDATE_STEPS.findIndex(([key]) => key === updateStep);
-    return `<ol class="sbw-steps">${UPDATE_STEPS.map(([key, label], i) => {
-        const cls = i < at || updateStep === 'done' ? 'sbw-step-done' : i === at ? 'sbw-step-now' : '';
-        return `<li class="${cls}"><span class="sbw-step-dot">${i < at || updateStep === 'done' ? icons.check : i + 1}</span>${esc(label)}</li>`;
-    }).join('')}</ol>
-    ${updateStep && updateStep !== 'done' ? '<div class="sbw-progress"><span></span></div>' : ''}`;
+// Share of the overall bar per stage, roughly how long each one takes, so the
+// overall bar moves evenly instead of racing through the quick ones.
+const STAGE_WEIGHT = { check: 5, backup: 15, download: 25, merge: 35, migrate: 20 };
+
+// One row per stage — check, backup, download, merge, migrate — each with its
+// own bar and percentage, from the server's live snapshot.
+function stagesView() {
+    const stages = updateStages(liveProgress);
+    if (!liveProgress && updateStep === 'running') {
+        Object.assign(stages[0], { status: 'running', percent: 5, detail: 'Checking the update server…' });
+    }
+
+    const weight = (st) => STAGE_WEIGHT[st.key] || 0;
+    const totalWeight = stages.reduce((sum, st) => sum + weight(st), 0) || 1;
+    const overall = Math.floor(stages.reduce((sum, st) => sum + weight(st) * (st.status === 'done' || st.status === 'skipped' ? 100 : st.percent), 0) / totalWeight);
+    const target = liveProgress?.to_version;
+
+    return {
+        title: (target ? `Installing v${target}` : 'Preparing the update') + (liveStepNo > 1 ? ` · step ${liveStepNo}` : ''),
+        overall: updateStep === 'done' ? 100 : overall,
+        stages: stages.map((st, i) => {
+            const pct = st.status === 'skipped' ? 100 : st.percent;
+            const mark = st.status === 'done' || st.status === 'skipped' ? 'check' : st.status === 'failed' ? '!' : String(i + 1);
+            return {
+                ...st,
+                pct,
+                mark,
+                // Running with nothing measurable yet (backup, a download of unknown size).
+                busy: st.status === 'running' && st.percent < 1,
+                pctLabel: STAGE_STATUS[st.status] && st.status !== 'done' ? STAGE_STATUS[st.status] : pct + '%',
+            };
+        }),
+    };
 }
+
+const markHtml = (mark) => (mark === 'check' ? icons.check : esc(mark));
+
+function stagesHtml() {
+    const view = stagesView();
+    return `<p class="sbw-stages-head"><span>${esc(view.title)}</span><strong>${view.overall}%</strong></p>
+        <div class="sbw-bar sbw-bar-overall${updateStep === 'failed' ? ' sbw-bar-failed' : ''}" role="progressbar" aria-label="Overall progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${view.overall}"><span style="width:${view.overall}%"></span></div>
+        <ol class="sbw-stages">${view.stages.map((st) => `<li class="sbw-stage sbw-stage-${esc(st.status)}" data-stage="${esc(st.key)}">
+                <div class="sbw-stage-head">
+                    <span class="sbw-stage-dot" data-mark="${esc(st.mark)}">${markHtml(st.mark)}</span>
+                    <span class="sbw-stage-label">${esc(st.label)}</span>
+                    <span class="sbw-stage-pct">${esc(st.pctLabel)}</span>
+                </div>
+                <div class="sbw-bar${st.busy ? ' sbw-bar-busy' : ''}" role="progressbar" aria-label="${esc(st.label)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${st.pct}"><span style="width:${st.pct}%"></span></div>
+                <p class="sbw-stage-detail">${esc(st.detail || '')}</p>
+            </li>`).join('')}</ol>`;
+}
+
+// A progress tick only moves the numbers: rebuilding the card on every poll
+// restarted the bar animations, jumped the layout and reset its scroll —
+// the modal "blinked" for the whole update.
+function patchStages() {
+    const view = stagesView();
+    const setText = (el, text) => {
+        if (el && el.textContent !== text) el.textContent = text;
+    };
+
+    const setBar = (bar, pct, busy) => {
+        if (!bar) return;
+        bar.classList.toggle('sbw-bar-busy', !!busy);
+        if (bar.getAttribute('aria-valuenow') !== String(pct)) {
+            bar.setAttribute('aria-valuenow', pct);
+            bar.firstElementChild.style.width = pct + '%';
+        }
+    };
+
+    const head = modalCard.querySelector('.sbw-stages-head');
+    setText(head?.querySelector('span'), view.title);
+    setText(head?.querySelector('strong'), view.overall + '%');
+    setBar(modalCard.querySelector('.sbw-bar-overall'), view.overall);
+
+    for (const st of view.stages) {
+        const li = modalCard.querySelector(`[data-stage="${st.key}"]`);
+        if (!li) continue;
+
+        const cls = 'sbw-stage sbw-stage-' + st.status;
+        if (li.className !== cls) li.className = cls;
+
+        const dot = li.querySelector('.sbw-stage-dot');
+        if (dot && dot.dataset.mark !== st.mark) {
+            dot.dataset.mark = st.mark;
+            dot.innerHTML = markHtml(st.mark);
+        }
+
+        setText(li.querySelector('.sbw-stage-pct'), st.pctLabel);
+        setText(li.querySelector('.sbw-stage-detail'), st.detail || '');
+
+        setBar(li.querySelector('.sbw-bar'), st.pct, st.busy);
+    }
+}
+
+let modalShape = null; // what the update card was last built for, minus the numbers
 
 function renderModal(u, progress = null, error = null) {
     const news = changelogHtml(u);
 
     if (u.locked) {
+        modalShape = null;
         const fee = u.monthly_fee ? `${money(u.monthly_fee)} ${esc(u.currency || '')}` : null;
         modalCard.innerHTML = `
             <div class="sbw-hero sbw-hero-locked">
@@ -528,6 +616,15 @@ function renderModal(u, progress = null, error = null) {
     }
 
     const ready = !busy && updateStep === null;
+
+    // Same card, new numbers: patch in place instead of rebuilding.
+    const shape = JSON.stringify([u.latest_version, state.version, updateStep, busy, progress, error, ready]);
+    if (shape === modalShape && modalCard.querySelector('.sbw-stages')) {
+        patchStages();
+        return;
+    }
+    modalShape = shape;
+
     modalCard.innerHTML = `
         <div class="sbw-hero">
             <span class="sbw-hero-icon">${icons.gift}</span>
@@ -543,7 +640,7 @@ function renderModal(u, progress = null, error = null) {
                 <li>${icons.check} A full backup is taken first</li>
                 <li>${icons.check} Your data and settings stay as they are</li>
                 <li>${icons.check} Usually done in about a minute</li>
-            </ul>` : stepperHtml()}
+            </ul>` : stagesHtml()}
             ${progress ? `<p class="sbw-flash sbw-info" role="status">${esc(progress)}</p>` : ''}
             ${error ? `<p class="sbw-flash sbw-bad" role="alert">${esc(error)}</p>` : ''}
             <div class="sbw-actions">
@@ -633,7 +730,10 @@ function showModal() {
 
 function hideModal() {
     modal.hidden = true;
-    if (!busy) updateStep = null;
+    if (!busy) {
+        updateStep = null;
+        liveProgress = null;
+    }
 }
 
 function showPayModal() {
@@ -720,25 +820,33 @@ function applyVisibility() {
 async function runUpdate() {
     if (busy || unlicensed()) return;
     busy = 'update';
-    updateStep = 'check';
-    renderModal(state.update, 'Checking the update server…');
+    updateStep = 'running';
+    liveProgress = null;
+    liveStepNo = 1;
+    renderModal(state.update);
     render();
 
     // 1. The server confirms the provider is reachable before anything changes.
     const pre = await api.preflight();
     if (!pre.ok) {
         busy = null;
-        updateStep = null;
+        updateStep = 'failed';
+        liveProgress = { current: 'check', stages: { check: { status: 'failed', percent: 0, detail: pre.message || null } } };
         renderModal(state.update, null, pre.message || 'The update server is not reachable. Please try again later.');
         refresh(true);
         return;
     }
 
-    // 2. Backup + download + install, one version step at a time.
-    updateStep = 'install';
-    renderModal(state.update, 'Backing up and installing… please keep this page open.');
-    const result = await api.runUpdate(({ message }) => renderModal(state.update, message));
+    // 2. Backup, download, merge and migrate, one version step at a time;
+    //    every stage reports its own percentage while the step runs.
+    const result = await api.runUpdate(({ message, step, progress, version, more }) => {
+        if (step && step !== liveStepNo) liveProgress = null;
+        liveStepNo = step || liveStepNo;
+        if (progress) liveProgress = progress;
+        renderModal(state.update, version && more ? `${message} Continuing with the next version…` : null);
+    });
     busy = null;
+    if (result.progress) liveProgress = result.progress;
 
     if (result.ok) {
         updateStep = 'done';
@@ -747,7 +855,7 @@ async function runUpdate() {
         return;
     }
 
-    updateStep = null;
+    updateStep = 'failed';
     renderModal(state.update, null, result.message || 'Update failed.');
     refresh(true);
 }

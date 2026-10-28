@@ -176,12 +176,61 @@ class BackupService
         return ! $lastSuccess || $lastSuccess->lt(now()->subDay());
     }
 
-    public function runBackup(bool $force = false): array
+    /**
+     * An update step is applying files/migrations right now. A backup taken
+     * meanwhile would dump a half-migrated database and slow both down.
+     */
+    public function updateInProgress(?LicenseState $state = null): bool
+    {
+        $state ??= LicenseState::current();
+
+        return (bool) $state->update_running
+            && $state->update_started_at
+            && $state->update_started_at->gt(now()->subMinutes($this->staleMinutes()));
+    }
+
+    /**
+     * Blocks until a backup running in another process finishes, reading the
+     * flag from the database (not the cached row). $onWait gets the seconds
+     * waited so far.
+     *
+     * @return bool false when it is still running after $timeoutSeconds
+     */
+    public function waitUntilIdle(int $timeoutSeconds, ?callable $onWait = null): bool
+    {
+        $started = time();
+
+        while ($this->isRunning($this->freshState())) {
+            if (time() - $started >= $timeoutSeconds) {
+                return false;
+            }
+            if ($onWait) {
+                $onWait(time() - $started);
+            }
+            sleep(3);
+        }
+
+        return true;
+    }
+
+    /**
+     * @param bool $beforeUpdate  the updater's own pre-update backup, which must
+     *                            not be held back by the update it belongs to
+     */
+    public function runBackup(bool $force = false, bool $beforeUpdate = false): array
     {
         $state = LicenseState::current();
 
         if ($this->isRunning($state)) {
             return ['ok' => false, 'running' => true, 'message' => 'A backup is already running.'];
+        }
+
+        if (! $beforeUpdate && $this->updateInProgress($state)) {
+            // Automatic runs just wait (nothing recorded, so the next scheduler
+            // tick retries once the update is done); a click is told why.
+            return $force
+                ? ['ok' => false, 'busy' => 'update', 'message' => 'An update is being installed. Start the backup again once it has finished.']
+                : ['ok' => true, 'skipped' => true, 'message' => 'An update is being installed; the backup runs after it.'];
         }
 
         if (! $state->isUsable()) {
@@ -218,7 +267,11 @@ class BackupService
             return $result;
         }
 
-        $state->forceFill(['backup_running' => true, 'backup_started_at' => now()])->save();
+        // Claimed atomically: the scheduler, the browser's auto-check, the
+        // button and the updater can all get here at the same moment.
+        if (! $this->claim($state)) {
+            return ['ok' => false, 'running' => true, 'message' => 'A backup is already running.'];
+        }
 
         try {
             $dump = $this->dumpDatabase();
@@ -555,6 +608,30 @@ class BackupService
     private function stagingPath(): string
     {
         return rtrim((string) config('subandl.backup.staging_path', storage_path('app/backup-staging')), '/\\');
+    }
+
+    /** Sets backup_running only if no live backup holds it; false when one does. */
+    private function claim(LicenseState $state): bool
+    {
+        $claimed = LicenseState::query()
+            ->whereKey($state->getKey())
+            ->where(fn ($q) => $q->where('backup_running', false)
+                ->orWhereNull('backup_running')
+                ->orWhereNull('backup_started_at')
+                ->orWhere('backup_started_at', '<', now()->subMinutes($this->staleMinutes())))
+            ->update(['backup_running' => true, 'backup_started_at' => now()]);
+
+        if ($claimed) {
+            // update() bypasses model events, so drop the cached row by hand.
+            $state->forceFill(['backup_running' => true, 'backup_started_at' => now()])->save();
+        }
+
+        return $claimed > 0;
+    }
+
+    private function freshState(): LicenseState
+    {
+        return LicenseState::query()->firstOrFail();
     }
 
     private function staleMinutes(): int

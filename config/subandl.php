@@ -294,6 +294,11 @@ return [
         'download_timeout' => 300,
         'run_migrations' => true,
 
+        // A backup already running when an update starts (scheduler, the
+        // "Backup now" button) is waited for this long instead of rejecting
+        // the update; when it succeeds it counts as the pre-update backup.
+        'backup_wait_minutes' => 10,
+
         // Paths (relative to base_path) a release package may never overwrite.
         'protected_paths' => [
             '.env',
