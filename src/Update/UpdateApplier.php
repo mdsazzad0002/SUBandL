@@ -10,6 +10,7 @@ use SUBandL\Models\LicenseState;
 use SUBandL\Models\UpdateHistory;
 use SUBandL\Support\CliPhpBinary;
 use SUBandL\Support\HttpClient;
+use SUBandL\Support\Platform;
 use SUBandL\Support\UpdateNotice;
 use Symfony\Component\Process\Process;
 use ZipArchive;
@@ -414,68 +415,116 @@ class UpdateApplier
     }
 
     /**
-     * Merges the package into $destination. An entry whose target already has
-     * the same size and CRC32 is left alone — most of a release is usually
-     * unchanged, and reading a file is far cheaper than rewriting, chmod-ing
-     * and renaming it. Progress is weighted by bytes, not entry count.
+     * Merges the package into $destination in two passes. First every entry is
+     * compared with the file already there: same size and CRC32 means it is
+     * left alone — most of a release is usually unchanged, and reading a file
+     * is far cheaper than rewriting it. Then only the changed entries are
+     * written (progress weighted by bytes).
+     *
+     * On Windows the changed entries go out in batches through the native
+     * ZipArchive::extractTo(): one write per file instead of temp file + rename
+     * (each of which Windows Defender scans) and a PHP-level copy per file.
+     * The owner-only-mtime problem that rules extractTo() out elsewhere does
+     * not exist there. A batch that fails is retried entry by entry, which
+     * names the file that could not be written.
      *
      * @return array{ok: bool, message?: string, extracted: int, written: int, unchanged: int}
      */
     private function extractZipSafely(ZipArchive $zip, string $destination): array
     {
         $destination = rtrim($destination, '/\\');
-        $written = 0;
         $unchanged = 0;
 
         $entries = [];
-        $totalBytes = 0;
         for ($i = 0; $i < $zip->numFiles; $i++) {
             $stat = $zip->statIndex($i);
             $relative = $stat === false ? null : $this->safeRelativePath($stat['name']);
             if ($relative !== null) {
                 $entries[] = [$i, $stat, $relative];
-                $totalBytes += (int) $stat['size'];
             }
         }
 
+        // Pass 1 (0–20%): find what actually changed.
         $count = count($entries);
-        $doneBytes = 0;
-        UpdateProgress::stage('merge', 0, "0 of {$count} files");
-
-        foreach ($entries as $n => [$i, $stat, $relative]) {
-            $entryPath = $stat['name'];
-            $target = $destination . '/' . $relative;
-
-            if ($this->isUnchanged($stat, $target)) {
+        $changed = [];
+        $changedBytes = 0;
+        UpdateProgress::stage('merge', 0, "Comparing 0 of {$count} files…");
+        foreach ($entries as $n => $entry) {
+            if ($this->isUnchanged($entry[1], $destination . '/' . $entry[2])) {
                 $unchanged++;
             } else {
-                // Laravel turns warnings into ErrorException; both that and a
-                // plain failure end the extraction with the entry named.
-                try {
-                    $error = $this->extractEntry($zip, $i, $entryPath, $target, $stat);
-                } catch (\ErrorException $e) {
-                    $error = $e->getMessage();
-                }
-
-                if ($error !== null) {
-                    return [
-                        'ok' => false,
-                        'message' => "failed to extract '{$entryPath}' ({$error})",
-                        'extracted' => $written,
-                        'written' => $written,
-                        'unchanged' => $unchanged,
-                    ];
-                }
-
-                $written++;
+                $changed[] = $entry;
+                $changedBytes += (int) $entry[1]['size'];
             }
+            UpdateProgress::stage('merge', 20 * ($n + 1) / max(1, $count), 'Comparing ' . ($n + 1) . " of {$count} files · " . count($changed) . ' changed');
+        }
 
-            $doneBytes += (int) $stat['size'];
+        // Pass 2 (20–100%): write only the changed entries.
+        $total = count($changed);
+        $written = 0;
+        $doneBytes = 0;
+        $report = function () use (&$written, &$doneBytes, $total, $changedBytes, $unchanged) {
             UpdateProgress::stage(
                 'merge',
-                $totalBytes > 0 ? 100 * $doneBytes / $totalBytes : 100 * ($n + 1) / $count,
-                ($n + 1) . " of {$count} files · {$written} updated, {$unchanged} unchanged"
+                20 + 80 * ($changedBytes > 0 ? $doneBytes / $changedBytes : $written / max(1, $total)),
+                "Writing {$written} of {$total} changed files · {$unchanged} unchanged"
             );
+        };
+        $failed = fn (string $entryPath, string $error) => [
+            'ok' => false,
+            'message' => "failed to extract '{$entryPath}' ({$error})",
+            'extracted' => $written,
+            'written' => $written,
+            'unchanged' => $unchanged,
+        ];
+
+        $batches = Platform::isWindows() ? array_chunk($changed, 200) : [];
+        $single = $batches ? [] : $changed;
+
+        foreach ($batches as $batch) {
+            // Only entries whose name is already the clean relative path can
+            // go through extractTo(); the rest take the careful route.
+            $names = [];
+            foreach ($batch as [$i, $stat, $relative]) {
+                if ($stat['name'] === $relative) {
+                    $names[] = $relative;
+                    $this->knownDirs[dirname($destination . '/' . $relative)] = true;
+                }
+            }
+
+            try {
+                $ok = $names !== [] && $zip->extractTo($destination, $names);
+            } catch (\ErrorException $e) {
+                $ok = false;
+            }
+
+            foreach ($batch as $entry) {
+                if ($ok && $entry[1]['name'] === $entry[2]) {
+                    $written++;
+                    $doneBytes += (int) $entry[1]['size'];
+                } else {
+                    $single[] = $entry;
+                }
+            }
+            $report();
+        }
+
+        foreach ($single as [$i, $stat, $relative]) {
+            // Laravel turns warnings into ErrorException; both that and a
+            // plain failure end the extraction with the entry named.
+            try {
+                $error = $this->extractEntry($zip, $i, $stat['name'], $destination . '/' . $relative, $stat);
+            } catch (\ErrorException $e) {
+                $error = $e->getMessage();
+            }
+
+            if ($error !== null) {
+                return $failed($stat['name'], $error);
+            }
+
+            $written++;
+            $doneBytes += (int) $stat['size'];
+            $report();
         }
 
         return ['ok' => true, 'extracted' => $written + $unchanged, 'written' => $written, 'unchanged' => $unchanged];
@@ -554,7 +603,10 @@ class UpdateApplier
             return 'the archive entry is corrupt';
         }
 
-        @chmod($temp, is_file($target) ? (fileperms($target) & 0777) : 0644);
+        // Windows has no Unix permissions to carry over.
+        if (! Platform::isWindows()) {
+            @chmod($temp, is_file($target) ? (fileperms($target) & 0777) : 0644);
+        }
 
         if (@rename($temp, $target)) {
             return null;
