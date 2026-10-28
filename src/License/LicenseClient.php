@@ -97,8 +97,12 @@ class LicenseClient
         // `latest_version`, so fall back to a direct version comparison.
         $updateAvailable = (bool) ($json['update_available'] ?? false);
         $locked = (bool) ($json['update_locked'] ?? false);
-        if ($latestVersion && version_compare((string) $latestVersion, $currentVersion, '>')) {
-            $updateAvailable = true;
+        if ($latestVersion) {
+            // Version comparison is authoritative. A provider may retain a
+            // stale update_available=true flag after this installation has
+            // already applied that release; never reapply the same or an
+            // older package.
+            $updateAvailable = version_compare((string) $latestVersion, $currentVersion, '>');
         }
 
         return [
