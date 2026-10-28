@@ -493,7 +493,7 @@ const STAGE_STATUS = { done: 'Done', skipped: 'Skipped', failed: 'Failed' };
 
 // One row per stage — check, backup, download, merge, migrate — each with its
 // own bar and percentage, from the server's live snapshot.
-function stagesHtml() {
+function stagesView() {
     const stages = updateStages(liveProgress);
     if (!liveProgress && updateStep === 'running') {
         Object.assign(stages[0], { status: 'running', percent: 5, detail: 'Checking the update server…' });
@@ -502,29 +502,82 @@ function stagesHtml() {
     const overall = Math.round(stages.reduce((sum, st) => sum + (st.status === 'skipped' ? 100 : st.percent), 0) / stages.length);
     const target = liveProgress?.to_version;
 
-    return `<p class="sbw-stages-head">
-            <span>${target ? `Installing v${esc(target)}` : 'Preparing the update'}${liveStepNo > 1 ? ` · step ${liveStepNo}` : ''}</span>
-            <strong>${updateStep === 'done' ? 100 : overall}%</strong>
-        </p>
-        <ol class="sbw-stages">${stages.map((st, i) => {
+    return {
+        title: (target ? `Installing v${target}` : 'Preparing the update') + (liveStepNo > 1 ? ` · step ${liveStepNo}` : ''),
+        overall: updateStep === 'done' ? 100 : overall,
+        stages: stages.map((st, i) => {
             const pct = st.status === 'skipped' ? 100 : st.percent;
-            const mark = st.status === 'done' || st.status === 'skipped' ? icons.check : st.status === 'failed' ? '!' : i + 1;
-            return `<li class="sbw-stage sbw-stage-${esc(st.status)}">
-                <div class="sbw-stage-head">
-                    <span class="sbw-stage-dot">${mark}</span>
-                    <span class="sbw-stage-label">${esc(st.label)}</span>
-                    <span class="sbw-stage-pct">${STAGE_STATUS[st.status] && st.status !== 'done' ? STAGE_STATUS[st.status] : pct + '%'}</span>
-                </div>
-                <div class="sbw-bar" role="progressbar" aria-label="${esc(st.label)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><span style="width:${pct}%"></span></div>
-                ${st.detail ? `<p class="sbw-stage-detail">${esc(st.detail)}</p>` : ''}
-            </li>`;
-        }).join('')}</ol>`;
+            const mark = st.status === 'done' || st.status === 'skipped' ? 'check' : st.status === 'failed' ? '!' : String(i + 1);
+            return {
+                ...st,
+                pct,
+                mark,
+                pctLabel: STAGE_STATUS[st.status] && st.status !== 'done' ? STAGE_STATUS[st.status] : pct + '%',
+            };
+        }),
+    };
 }
+
+const markHtml = (mark) => (mark === 'check' ? icons.check : esc(mark));
+
+function stagesHtml() {
+    const view = stagesView();
+    return `<p class="sbw-stages-head"><span>${esc(view.title)}</span><strong>${view.overall}%</strong></p>
+        <ol class="sbw-stages">${view.stages.map((st) => `<li class="sbw-stage sbw-stage-${esc(st.status)}" data-stage="${esc(st.key)}">
+                <div class="sbw-stage-head">
+                    <span class="sbw-stage-dot" data-mark="${esc(st.mark)}">${markHtml(st.mark)}</span>
+                    <span class="sbw-stage-label">${esc(st.label)}</span>
+                    <span class="sbw-stage-pct">${esc(st.pctLabel)}</span>
+                </div>
+                <div class="sbw-bar" role="progressbar" aria-label="${esc(st.label)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${st.pct}"><span style="width:${st.pct}%"></span></div>
+                <p class="sbw-stage-detail">${esc(st.detail || '')}</p>
+            </li>`).join('')}</ol>`;
+}
+
+// A progress tick only moves the numbers: rebuilding the card on every poll
+// restarted the bar animations, jumped the layout and reset its scroll —
+// the modal "blinked" for the whole update.
+function patchStages() {
+    const view = stagesView();
+    const setText = (el, text) => {
+        if (el && el.textContent !== text) el.textContent = text;
+    };
+
+    const head = modalCard.querySelector('.sbw-stages-head');
+    setText(head?.querySelector('span'), view.title);
+    setText(head?.querySelector('strong'), view.overall + '%');
+
+    for (const st of view.stages) {
+        const li = modalCard.querySelector(`[data-stage="${st.key}"]`);
+        if (!li) continue;
+
+        const cls = 'sbw-stage sbw-stage-' + st.status;
+        if (li.className !== cls) li.className = cls;
+
+        const dot = li.querySelector('.sbw-stage-dot');
+        if (dot && dot.dataset.mark !== st.mark) {
+            dot.dataset.mark = st.mark;
+            dot.innerHTML = markHtml(st.mark);
+        }
+
+        setText(li.querySelector('.sbw-stage-pct'), st.pctLabel);
+        setText(li.querySelector('.sbw-stage-detail'), st.detail || '');
+
+        const bar = li.querySelector('.sbw-bar');
+        if (bar && bar.getAttribute('aria-valuenow') !== String(st.pct)) {
+            bar.setAttribute('aria-valuenow', st.pct);
+            bar.firstElementChild.style.width = st.pct + '%';
+        }
+    }
+}
+
+let modalShape = null; // what the update card was last built for, minus the numbers
 
 function renderModal(u, progress = null, error = null) {
     const news = changelogHtml(u);
 
     if (u.locked) {
+        modalShape = null;
         const fee = u.monthly_fee ? `${money(u.monthly_fee)} ${esc(u.currency || '')}` : null;
         modalCard.innerHTML = `
             <div class="sbw-hero sbw-hero-locked">
@@ -548,6 +601,15 @@ function renderModal(u, progress = null, error = null) {
     }
 
     const ready = !busy && updateStep === null;
+
+    // Same card, new numbers: patch in place instead of rebuilding.
+    const shape = JSON.stringify([u.latest_version, state.version, updateStep, busy, progress, error, ready]);
+    if (shape === modalShape && modalCard.querySelector('.sbw-stages')) {
+        patchStages();
+        return;
+    }
+    modalShape = shape;
+
     modalCard.innerHTML = `
         <div class="sbw-hero">
             <span class="sbw-hero-icon">${icons.gift}</span>
