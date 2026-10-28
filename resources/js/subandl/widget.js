@@ -491,6 +491,10 @@ function changelogHtml(u) {
 
 const STAGE_STATUS = { done: 'Done', skipped: 'Skipped', failed: 'Failed' };
 
+// Share of the overall bar per stage, roughly how long each one takes, so the
+// overall bar moves evenly instead of racing through the quick ones.
+const STAGE_WEIGHT = { check: 5, backup: 15, download: 25, merge: 35, migrate: 20 };
+
 // One row per stage — check, backup, download, merge, migrate — each with its
 // own bar and percentage, from the server's live snapshot.
 function stagesView() {
@@ -499,7 +503,9 @@ function stagesView() {
         Object.assign(stages[0], { status: 'running', percent: 5, detail: 'Checking the update server…' });
     }
 
-    const overall = Math.round(stages.reduce((sum, st) => sum + (st.status === 'skipped' ? 100 : st.percent), 0) / stages.length);
+    const weight = (st) => STAGE_WEIGHT[st.key] || 0;
+    const totalWeight = stages.reduce((sum, st) => sum + weight(st), 0) || 1;
+    const overall = Math.floor(stages.reduce((sum, st) => sum + weight(st) * (st.status === 'done' || st.status === 'skipped' ? 100 : st.percent), 0) / totalWeight);
     const target = liveProgress?.to_version;
 
     return {
@@ -512,6 +518,8 @@ function stagesView() {
                 ...st,
                 pct,
                 mark,
+                // Running with nothing measurable yet (backup, a download of unknown size).
+                busy: st.status === 'running' && st.percent < 1,
                 pctLabel: STAGE_STATUS[st.status] && st.status !== 'done' ? STAGE_STATUS[st.status] : pct + '%',
             };
         }),
@@ -523,13 +531,14 @@ const markHtml = (mark) => (mark === 'check' ? icons.check : esc(mark));
 function stagesHtml() {
     const view = stagesView();
     return `<p class="sbw-stages-head"><span>${esc(view.title)}</span><strong>${view.overall}%</strong></p>
+        <div class="sbw-bar sbw-bar-overall${updateStep === 'failed' ? ' sbw-bar-failed' : ''}" role="progressbar" aria-label="Overall progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${view.overall}"><span style="width:${view.overall}%"></span></div>
         <ol class="sbw-stages">${view.stages.map((st) => `<li class="sbw-stage sbw-stage-${esc(st.status)}" data-stage="${esc(st.key)}">
                 <div class="sbw-stage-head">
                     <span class="sbw-stage-dot" data-mark="${esc(st.mark)}">${markHtml(st.mark)}</span>
                     <span class="sbw-stage-label">${esc(st.label)}</span>
                     <span class="sbw-stage-pct">${esc(st.pctLabel)}</span>
                 </div>
-                <div class="sbw-bar" role="progressbar" aria-label="${esc(st.label)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${st.pct}"><span style="width:${st.pct}%"></span></div>
+                <div class="sbw-bar${st.busy ? ' sbw-bar-busy' : ''}" role="progressbar" aria-label="${esc(st.label)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${st.pct}"><span style="width:${st.pct}%"></span></div>
                 <p class="sbw-stage-detail">${esc(st.detail || '')}</p>
             </li>`).join('')}</ol>`;
 }
@@ -543,9 +552,19 @@ function patchStages() {
         if (el && el.textContent !== text) el.textContent = text;
     };
 
+    const setBar = (bar, pct, busy) => {
+        if (!bar) return;
+        bar.classList.toggle('sbw-bar-busy', !!busy);
+        if (bar.getAttribute('aria-valuenow') !== String(pct)) {
+            bar.setAttribute('aria-valuenow', pct);
+            bar.firstElementChild.style.width = pct + '%';
+        }
+    };
+
     const head = modalCard.querySelector('.sbw-stages-head');
     setText(head?.querySelector('span'), view.title);
     setText(head?.querySelector('strong'), view.overall + '%');
+    setBar(modalCard.querySelector('.sbw-bar-overall'), view.overall);
 
     for (const st of view.stages) {
         const li = modalCard.querySelector(`[data-stage="${st.key}"]`);
@@ -563,11 +582,7 @@ function patchStages() {
         setText(li.querySelector('.sbw-stage-pct'), st.pctLabel);
         setText(li.querySelector('.sbw-stage-detail'), st.detail || '');
 
-        const bar = li.querySelector('.sbw-bar');
-        if (bar && bar.getAttribute('aria-valuenow') !== String(st.pct)) {
-            bar.setAttribute('aria-valuenow', st.pct);
-            bar.firstElementChild.style.width = st.pct + '%';
-        }
+        setBar(li.querySelector('.sbw-bar'), st.pct, st.busy);
     }
 }
 

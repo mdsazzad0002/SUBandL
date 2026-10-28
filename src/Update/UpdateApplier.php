@@ -32,6 +32,8 @@ use ZipArchive;
  */
 class UpdateApplier
 {
+    private const CORRUPT = 'the archive entry is corrupt';
+
     /** Folders already known to exist during this merge. @var array<string, true> */
     private array $knownDirs = [];
 
@@ -143,7 +145,7 @@ class UpdateApplier
 
         // Not forced — only actually backs up when one is due (or none ever ran);
         // otherwise this is a no-op ('skipped' with ok: true).
-        UpdateProgress::stage('backup', 5, 'Checking whether a backup is due…');
+        UpdateProgress::stage('backup', 0, 'Checking whether a backup is due…');
         $backupResult = $this->backupService->runBackup();
         if (! ($backupResult['ok'] ?? false)) {
             UpdateProgress::fail('backup', $backupResult['message'] ?? 'Backup failed.');
@@ -415,24 +417,26 @@ class UpdateApplier
     }
 
     /**
-     * Merges the package into $destination in two passes. First every entry is
-     * compared with the file already there: same size and CRC32 means it is
-     * left alone — most of a release is usually unchanged, and reading a file
-     * is far cheaper than rewriting it. Then only the changed entries are
-     * written (progress weighted by bytes).
+     * Merges the package into $destination in two passes. Measured on a 20,000
+     * file package, PHP's own overhead is small whatever the method (native
+     * extractTo() is no faster than this loop); the time goes into disk work.
+     * So the merge does as little of it as possible:
      *
-     * On Windows the changed entries go out in batches through the native
-     * ZipArchive::extractTo(): one write per file instead of temp file + rename
-     * (each of which Windows Defender scans) and a PHP-level copy per file.
-     * The owner-only-mtime problem that rules extractTo() out elsewhere does
-     * not exist there. A batch that fails is retried entry by entry, which
-     * names the file that could not be written.
+     *  1. Compare (0–15%): an entry whose target already has the same size and
+     *     CRC32 is left alone — most of a release is usually unchanged. The
+     *     CRC of each file this merge writes is remembered in a manifest with
+     *     its size and mtime, so the next update trusts an untouched file
+     *     without reading it at all; only files changed since are re-hashed.
+     *  2. Write (15–100%, by bytes): only the changed entries, with the fewest
+     *     file operations each (see extractEntry()).
      *
      * @return array{ok: bool, message?: string, extracted: int, written: int, unchanged: int}
      */
     private function extractZipSafely(ZipArchive $zip, string $destination): array
     {
         $destination = rtrim($destination, '/\\');
+        $manifest = $this->loadManifest($destination);
+        $seen = [];
         $unchanged = 0;
 
         $entries = [];
@@ -444,121 +448,145 @@ class UpdateApplier
             }
         }
 
-        // Pass 1 (0–20%): find what actually changed.
+        // Pass 1: find what actually changed.
         $count = count($entries);
         $changed = [];
         $changedBytes = 0;
         UpdateProgress::stage('merge', 0, "Comparing 0 of {$count} files…");
         foreach ($entries as $n => $entry) {
-            if ($this->isUnchanged($entry[1], $destination . '/' . $entry[2])) {
+            [, $stat, $relative] = $entry;
+            if ($this->isUnchanged($stat, $destination . '/' . $relative, $manifest[$relative] ?? null)) {
                 $unchanged++;
+                $seen[$relative] = $stat;
             } else {
                 $changed[] = $entry;
-                $changedBytes += (int) $entry[1]['size'];
+                $changedBytes += (int) $stat['size'];
             }
-            UpdateProgress::stage('merge', 20 * ($n + 1) / max(1, $count), 'Comparing ' . ($n + 1) . " of {$count} files · " . count($changed) . ' changed');
+            UpdateProgress::stage('merge', 15 * ($n + 1) / max(1, $count), 'Comparing ' . ($n + 1) . " of {$count} files · " . count($changed) . ' changed');
         }
 
-        // Pass 2 (20–100%): write only the changed entries.
+        // Pass 2: write only the changed entries.
         $total = count($changed);
         $written = 0;
         $doneBytes = 0;
-        $report = function () use (&$written, &$doneBytes, $total, $changedBytes, $unchanged) {
-            UpdateProgress::stage(
-                'merge',
-                20 + 80 * ($changedBytes > 0 ? $doneBytes / $changedBytes : $written / max(1, $total)),
-                "Writing {$written} of {$total} changed files · {$unchanged} unchanged"
-            );
-        };
-        $failed = fn (string $entryPath, string $error) => [
-            'ok' => false,
-            'message' => "failed to extract '{$entryPath}' ({$error})",
-            'extracted' => $written,
-            'written' => $written,
-            'unchanged' => $unchanged,
-        ];
-
-        $batches = Platform::isWindows() ? array_chunk($changed, 200) : [];
-        $single = $batches ? [] : $changed;
-
-        foreach ($batches as $batch) {
-            // Only entries whose name is already the clean relative path can
-            // go through extractTo(); the rest take the careful route.
-            $names = [];
-            foreach ($batch as [$i, $stat, $relative]) {
-                if ($stat['name'] === $relative) {
-                    $names[] = $relative;
-                    $this->knownDirs[dirname($destination . '/' . $relative)] = true;
-                }
-            }
-
-            try {
-                $ok = $names !== [] && $zip->extractTo($destination, $names);
-            } catch (\ErrorException $e) {
-                $ok = false;
-            }
-
-            foreach ($batch as $entry) {
-                if ($ok && $entry[1]['name'] === $entry[2]) {
-                    $written++;
-                    $doneBytes += (int) $entry[1]['size'];
-                } else {
-                    $single[] = $entry;
-                }
-            }
-            $report();
-        }
-
-        foreach ($single as [$i, $stat, $relative]) {
+        foreach ($changed as [$i, $stat, $relative]) {
             // Laravel turns warnings into ErrorException; both that and a
             // plain failure end the extraction with the entry named.
             try {
-                $error = $this->extractEntry($zip, $i, $stat['name'], $destination . '/' . $relative, $stat);
+                $error = $this->extractEntry($zip, $i, $destination . '/' . $relative, $stat);
             } catch (\ErrorException $e) {
                 $error = $e->getMessage();
             }
 
             if ($error !== null) {
-                return $failed($stat['name'], $error);
+                $this->saveManifest($destination, $manifest, $seen);
+
+                return [
+                    'ok' => false,
+                    'message' => "failed to extract '{$stat['name']}' ({$error})",
+                    'extracted' => $written,
+                    'written' => $written,
+                    'unchanged' => $unchanged,
+                ];
             }
 
+            $seen[$relative] = $stat;
             $written++;
             $doneBytes += (int) $stat['size'];
-            $report();
+            UpdateProgress::stage(
+                'merge',
+                15 + 85 * ($changedBytes > 0 ? $doneBytes / $changedBytes : $written / max(1, $total)),
+                "Writing {$written} of {$total} changed files · {$unchanged} unchanged"
+            );
         }
+
+        $this->saveManifest($destination, $manifest, $seen);
 
         return ['ok' => true, 'extracted' => $written + $unchanged, 'written' => $written, 'unchanged' => $unchanged];
     }
 
-    private function isUnchanged(array $stat, string $target): bool
+    /**
+     * @param array{0: int, 1: int, 2: int}|null $known  [size, mtime, crc] the manifest holds for this file
+     */
+    private function isUnchanged(array $stat, string $target, ?array $known): bool
     {
         if (str_ends_with($stat['name'], '/')) {
             return is_dir($target);
         }
 
-        if (! is_file($target) || @filesize($target) !== (int) $stat['size']) {
+        $size = @filesize($target);
+        if ($size === false || $size !== (int) $stat['size']) {
             return false;
+        }
+
+        $crc = (int) $stat['crc'] & 0xFFFFFFFF;
+
+        // Untouched since the last merge wrote or checked it: its CRC is known.
+        if ($known !== null && $known[0] === $size && $known[1] === @filemtime($target)) {
+            return $known[2] === $crc;
         }
 
         $hash = @hash_file('crc32b', $target);
 
-        return $hash !== false && hexdec($hash) === ((int) $stat['crc'] & 0xFFFFFFFF);
+        return $hash !== false && hexdec($hash) === $crc;
+    }
+
+    private function manifestPath(): string
+    {
+        return rtrim((string) config('subandl.update.staging_path', storage_path('app/update-staging')), '/\\')
+            . DIRECTORY_SEPARATOR . 'installed-files.json';
+    }
+
+    /** @return array<string, array{0: int, 1: int, 2: int}> relative path => [size, mtime, crc] */
+    private function loadManifest(string $destination): array
+    {
+        $data = json_decode((string) @file_get_contents($this->manifestPath()), true);
+
+        return is_array($data) && ($data['root'] ?? null) === $destination && is_array($data['files'] ?? null)
+            ? $data['files']
+            : [];
+    }
+
+    /** @param array<string, array> $seen  relative path => zip stat, for every file now matching the package */
+    private function saveManifest(string $destination, array $manifest, array $seen): void
+    {
+        clearstatcache();
+        foreach ($seen as $relative => $stat) {
+            if (str_ends_with($stat['name'], '/')) {
+                continue;
+            }
+            $mtime = @filemtime($destination . '/' . $relative);
+            if ($mtime !== false) {
+                $manifest[$relative] = [(int) $stat['size'], $mtime, (int) $stat['crc'] & 0xFFFFFFFF];
+            }
+        }
+
+        $path = $this->manifestPath();
+        if (is_dir(dirname($path)) || @mkdir(dirname($path), 0755, true)) {
+            @file_put_contents($path, json_encode(['root' => $destination, 'files' => $manifest]));
+        }
     }
 
     /**
-     * Writes one entry without ZipArchive::extractTo(): that call also sets the
-     * file's mtime, which only the file's OWNER may do — so a file uploaded by
-     * another account (FTP, a deploy user) failed with "Operation not permitted"
-     * even though it was writable. Instead the entry goes to a temp file next to
-     * the target and is renamed over it, which only needs the folder to be
-     * writable (and swaps the file atomically); failing that, the existing file
-     * is overwritten in place.
+     * Writes one entry with as few file operations as each case needs:
+     *
+     *  - a NEW file is written straight to its place: nothing can be reading it;
+     *  - on Linux/macOS an EXISTING file is replaced through a temp file next to
+     *    it + rename(), so a request running mid-update never reads half a file,
+     *    and only the folder needs to be writable (a file owned by another
+     *    account — FTP, a deploy user — is replaced too; extractTo() fails on
+     *    those, as it also sets the mtime, which only the owner may);
+     *  - on Windows an existing file is overwritten in place: one operation
+     *    instead of create + rename, each of which Windows Defender scans, and
+     *    no permissions to carry over.
+     *
+     * Entries up to 8 MB are read in one call; bigger ones are streamed.
      *
      * @return string|null the error, or null on success
      */
-    private function extractEntry(ZipArchive $zip, int $index, string $entryPath, string $target, array $stat): ?string
+    private function extractEntry(ZipArchive $zip, int $index, string $target, array $stat): ?string
     {
-        if (str_ends_with($entryPath, '/')) {
+        if (str_ends_with($stat['name'], '/')) {
             return is_dir($target) || @mkdir($target, 0755, true) ? null : 'could not create directory';
         }
 
@@ -570,53 +598,80 @@ class UpdateApplier
             $this->knownDirs[$dir] = true;
         }
 
-        $expected = $stat['size'] ?? null;
-        $input = $zip->getStream($entryPath);
-        if ($input === false) {
-            return $zip->getStatusString() ?: 'could not read the entry';
+        $size = (int) $stat['size'];
+        if ($size <= 8 * 1024 * 1024) {
+            $source = $zip->getFromIndex($index);
+            if ($source === false || strlen($source) !== $size) {
+                return $source === false ? ($zip->getStatusString() ?: 'could not read the entry') : self::CORRUPT;
+            }
+        } else {
+            $source = $zip->getStream($stat['name']);
+            if ($source === false) {
+                return $zip->getStatusString() ?: 'could not read the entry';
+            }
         }
 
-        $temp = $dir . '/.subandl-' . bin2hex(random_bytes(6)) . '.tmp';
-        $output = @fopen($temp, 'wb');
-
-        if ($output === false) {
-            // The folder itself is not writable: overwrite the file in place.
-            $contents = stream_get_contents($input);
-            fclose($input);
-
-            if ($contents === false || ($expected !== null && strlen($contents) !== $expected)) {
-                return 'the archive entry is corrupt';
+        try {
+            $exists = is_file($target);
+            if (! $exists || Platform::isWindows()) {
+                return $this->writeFile($target, $source, $size);
             }
 
-            return @file_put_contents($target, $contents) === strlen($contents)
-                ? null
-                : (error_get_last()['message'] ?? 'permission denied');
-        }
+            $temp = $dir . '/.subandl-' . bin2hex(random_bytes(6)) . '.tmp';
+            $error = $this->writeFile($temp, $source, $size);
+            if ($error === self::CORRUPT) {
+                @unlink($temp);
 
-        $written = stream_copy_to_stream($input, $output);
-        fclose($input);
-        fclose($output);
+                return $error;
+            }
 
-        if ($written === false || ($expected !== null && $written !== $expected)) {
+            if ($error !== null) {
+                // The folder itself is not writable: overwrite the file in place.
+                @unlink($temp);
+                if (is_resource($source)) {
+                    fclose($source);
+                    $source = $zip->getStream($stat['name']);
+                }
+
+                return $this->writeFile($target, $source, $size);
+            }
+
+            @chmod($temp, fileperms($target) & 0777);
+            if (@rename($temp, $target)) {
+                return null;
+            }
+
+            // Rename refused (sticky folder, target is a directory…): overwrite in place.
+            $ok = @copy($temp, $target);
             @unlink($temp);
 
-            return 'the archive entry is corrupt';
+            return $ok ? null : (error_get_last()['message'] ?? 'permission denied');
+        } finally {
+            if (is_resource($source)) {
+                fclose($source);
+            }
+        }
+    }
+
+    /**
+     * @param string|resource $source  the entry's bytes, or a stream of them
+     * @return string|null null on success, else the error
+     */
+    private function writeFile(string $path, mixed $source, int $size): ?string
+    {
+        if (is_string($source)) {
+            return @file_put_contents($path, $source) === $size ? null : (error_get_last()['message'] ?? 'permission denied');
         }
 
-        // Windows has no Unix permissions to carry over.
-        if (! Platform::isWindows()) {
-            @chmod($temp, is_file($target) ? (fileperms($target) & 0777) : 0644);
+        $output = @fopen($path, 'wb');
+        if ($output === false) {
+            return error_get_last()['message'] ?? 'permission denied';
         }
 
-        if (@rename($temp, $target)) {
-            return null;
-        }
+        $written = stream_copy_to_stream($source, $output);
+        fclose($output);
 
-        // Rename refused (sticky folder, target is a directory…): overwrite in place.
-        $ok = @copy($temp, $target);
-        @unlink($temp);
-
-        return $ok ? null : (error_get_last()['message'] ?? 'permission denied');
+        return $written === $size ? null : self::CORRUPT;
     }
 
     /**

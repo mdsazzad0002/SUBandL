@@ -197,7 +197,13 @@ html.sbw-noscroll, html.sbw-noscroll body { overflow: hidden !important; }
 .sbw-stage-detail { min-height: 1.4em; margin: 6px 0 0; overflow: hidden; font-size: 12px; line-height: 1.4; color: var(--sbw-muted); white-space: nowrap; text-overflow: ellipsis; }
 .sbw-stage-failed .sbw-stage-detail { white-space: normal; overflow-wrap: anywhere; }
 .sbw-bar { position: relative; height: 6px; overflow: hidden; border-radius: 99px; background: var(--sbw-soft); }
-.sbw-bar span { position: absolute; inset: 0 auto 0 0; border-radius: 99px; background: var(--sbw-line); transition: width .35s ease; }
+.sbw-bar span { position: absolute; inset: 0 auto 0 0; border-radius: 99px; background: var(--sbw-line); transition: width .7s linear; }
+/* Overall bar: what the whole step has done, above the per-stage rows */
+.sbw-bar-overall { height: 10px; margin: 0 0 14px; }
+.sbw-bar-overall span { background: linear-gradient(90deg, #2563eb, #7c3aed); }
+.sbw-bar-overall.sbw-bar-failed span { background: var(--sbw-bad); }
+/* Running, but nothing measurable yet: a sliding stripe instead of a bar stuck at 0% */
+.sbw-bar-busy span { width: 35% !important; transition: none; animation: sbw-busy 1.2s ease-in-out infinite; }
 
 .sbw-stage-pending { opacity: .6; }
 .sbw-stage-running { border-color: var(--sbw-primary); box-shadow: 0 0 0 3px var(--sbw-info-bg); }
@@ -246,6 +252,7 @@ html.sbw-noscroll, html.sbw-noscroll body { overflow: hidden !important; }
 @keyframes sbw-fade { from { opacity: 0; } to { opacity: 1; } }
 @keyframes sbw-pop { from { opacity: 0; transform: translateY(12px) scale(.97); } to { opacity: 1; transform: none; } }
 @keyframes sbw-rise { from { opacity: 0; transform: translate(-50%, 12px); } to { opacity: 1; transform: translate(-50%, 0); } }
+@keyframes sbw-busy { 0% { left: -35%; } 100% { left: 100%; } }
 @keyframes sbw-shine { 0% { transform: translateX(-100%); } 100% { transform: translateX(100%); } }
 
 /* RTL hosts: dock on the left */
@@ -260,4 +267,5 @@ html.sbw-noscroll, html.sbw-noscroll body { overflow: hidden !important; }
     .sbw-modal, .sbw-modal-card, .sbw-banner { animation: none; }
     .sbw-stage-running .sbw-bar span::after { animation: none; }
     .sbw-bar span { transition: none; }
+    .sbw-bar-busy span { animation-duration: 4s; }
 }
