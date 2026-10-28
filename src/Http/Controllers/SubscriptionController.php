@@ -199,6 +199,12 @@ class SubscriptionController extends Controller
             return response()->json(['ok' => false, 'running' => true, 'message' => 'A backup is already running.'], 409);
         }
 
+        // An update takes its own backup first; a second one alongside it
+        // would dump a half-migrated database.
+        if ($service->updateInProgress()) {
+            return response()->json(['ok' => false, 'busy' => 'update', 'message' => 'An update is being installed. Start the backup again once it has finished.'], 409);
+        }
+
         if (BackgroundArtisan::dispatch('subandl:backup', ['--force'])) {
             return response()->json(['ok' => true, 'running' => true, 'message' => 'Backup started.']);
         }
@@ -219,6 +225,10 @@ class SubscriptionController extends Controller
     {
         if ($service->isRunning()) {
             return response()->json(['ok' => true, 'running' => true]);
+        }
+
+        if ($service->updateInProgress()) {
+            return response()->json(['ok' => true, 'skipped' => true, 'message' => 'An update is being installed; the backup runs after it.']);
         }
 
         if (BackgroundArtisan::dispatch('subandl:backup')) {

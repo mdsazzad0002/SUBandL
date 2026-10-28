@@ -145,8 +145,7 @@ class UpdateApplier
 
         // Not forced — only actually backs up when one is due (or none ever ran);
         // otherwise this is a no-op ('skipped' with ok: true).
-        UpdateProgress::stage('backup', 0, 'Checking whether a backup is due…');
-        $backupResult = $this->backupService->runBackup();
+        $backupResult = $this->preUpdateBackup();
         if (! ($backupResult['ok'] ?? false)) {
             UpdateProgress::fail('backup', $backupResult['message'] ?? 'Backup failed.');
 
@@ -270,6 +269,44 @@ class UpdateApplier
             'migration_output' => $migrationResult['output'],
             'commands_output' => $commandsResult['output'],
         ];
+    }
+
+    /**
+     * The backup before an update. A backup already running in another process
+     * (the scheduler, the browser's auto-check, the button) used to reject the
+     * update outright; now the update waits for it (up to backup_wait_minutes,
+     * default 10) — and when that backup succeeded it is the pre-update backup,
+     * since the schedule then reports the next one as not due.
+     */
+    private function preUpdateBackup(): array
+    {
+        $waitSeconds = 60 * (int) config('subandl.update.backup_wait_minutes', 10);
+        $waited = false;
+
+        for ($attempt = 1; ; $attempt++) {
+            if ($this->backupService->isRunning()) {
+                $waited = true;
+                $idle = $this->backupService->waitUntilIdle($waitSeconds, fn (int $waited) => UpdateProgress::stage(
+                    'backup',
+                    0,
+                    'Waiting for the backup already running to finish… (' . gmdate($waited >= 3600 ? 'G:i:s' : 'i:s', $waited) . ')'
+                ));
+
+                if (! $idle) {
+                    return ['ok' => false, 'message' => 'A backup is still running. Try the update again once it has finished.'];
+                }
+            }
+
+            UpdateProgress::stage('backup', 0, 'Checking whether a backup is due…');
+            $result = $this->backupService->runBackup(beforeUpdate: true);
+
+            // Another process claimed the backup between the check and the claim: wait for that one.
+            if (! ($result['running'] ?? false) || $attempt >= 3) {
+                return $waited && ($result['skipped'] ?? false) && ($result['ok'] ?? false)
+                    ? ['message' => 'Used the backup that just finished.'] + $result
+                    : $result;
+            }
+        }
     }
 
     /**
