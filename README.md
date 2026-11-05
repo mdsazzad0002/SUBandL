@@ -303,4 +303,5 @@ The update zip holds paths relative to the project root, for example `app/...` a
 
 ## Provider API contract
 
-`POST /api/verify-license`, `/api/check-update`, `/api/{module}-status`, `/api/backup/{initialize,chunk,complete}`. Every call carries `software`, `license_key`, `device_id` and `domain`.
+`POST /api/verify-license`, `/api/check-update`, `/api/{module}-status`, `/api/backup/{initialize,chunk,complete}`. Every call carries `software`, `license_key`, `client_name`, `date`, `device_id` and `domain`.
+Set `SUBANDL_CLIENT_NAME` when `APP_NAME` is not the customer's meaningful full name. Database backup filenames include the client name, software slug, database name and timestamp, so a downloaded backup can be identified without opening it.

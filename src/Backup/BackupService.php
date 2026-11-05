@@ -92,7 +92,12 @@ class BackupService
     {
         $cutoff = now()->subMinutes($this->staleMinutes())->timestamp;
 
-        foreach (glob($this->stagingPath() . '/database-*') ?: [] as $file) {
+        $files = array_merge(
+            glob($this->stagingPath() . '/database-*') ?: [],
+            glob($this->stagingPath() . '/*-database-backup-*') ?: [],
+        );
+
+        foreach (array_unique($files) as $file) {
             if (filemtime($file) < $cutoff) {
                 @unlink($file);
             }
@@ -468,7 +473,7 @@ class BackupService
         if (! is_dir($dir) && ! @mkdir($dir, 0755, true) && ! is_dir($dir)) {
             return ['path' => null, 'message' => "Could not create the staging folder '{$dir}'."];
         }
-        $base = $dir . DIRECTORY_SEPARATOR . 'database-' . now()->format('Y-m-d-H-i-s');
+        $base = $dir . DIRECTORY_SEPARATOR . $this->meaningfulBackupName($config);
 
         return match ($driver) {
             'mysql', 'mariadb' => $this->dumpMysql($config, "{$base}.sql"),
@@ -476,6 +481,32 @@ class BackupService
             'sqlite' => $this->dumpSqlite($config, "{$base}.sqlite"),
             default => ['path' => null, 'message' => "Unsupported database driver '{$driver}'."],
         };
+    }
+
+    /**
+     * Build a filename that identifies the customer, product and database
+     * without opening the backup file.
+     *
+     * @param array<string, mixed> $config
+     */
+    private function meaningfulBackupName(array $config): string
+    {
+        $parts = [
+            config('subandl.client_name', config('app.name', 'application')),
+            config('subandl.software_slug', 'software'),
+            $config['database'] ?? 'database',
+            'database-backup',
+            now()->format('Y-m-d-H-i-s'),
+        ];
+
+        return collect($parts)
+            ->map(function (mixed $part): string {
+                $name = strtolower(trim((string) $part));
+                $name = preg_replace('/[^a-z0-9]+/i', '-', $name) ?? '';
+
+                return trim($name, '-') ?: 'unknown';
+            })
+            ->implode('-');
     }
 
     /**

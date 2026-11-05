@@ -178,6 +178,8 @@ class LicenseClient
         return [
             'software' => config('subandl.software_slug'),
             'license_key' => LicenseState::resolveLicenseKey(),
+            'client_name' => (string) config('subandl.client_name', config('app.name', 'Laravel Application')),
+            'date' => now()->toDateString(),
             'device_id' => InstallationIdentity::current()->installation_uuid,
             // APP_URL's / the request's real domain; null on a local install,
             // also from cron (see IdentityWatch::bindingDomain).

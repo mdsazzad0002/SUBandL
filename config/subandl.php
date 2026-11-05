@@ -23,6 +23,11 @@ return [
     // Slug identifying this software product to the provider.
     'software_slug' => env('SUBANDL_SOFTWARE_SLUG', env('LICENSE_SOFTWARE_SLUG', 'pos-software')),
 
+    // Human-readable customer/application name sent with every provider call
+    // and included in backup filenames. Override per installation when APP_NAME
+    // is a generic framework name.
+    'client_name' => env('SUBANDL_CLIENT_NAME', env('APP_NAME', 'Laravel Application')),
+
     // Only used ONCE, to seed the license row on a brand-new install. After
     // that the database row is the single source of truth (see LicenseState).
     'license_key' => env('SUBANDL_LICENSE_KEY', env('LICENSE_KEY')),
