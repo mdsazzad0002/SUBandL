@@ -55,6 +55,7 @@ let updateStep = null; // null | 'running' | 'failed' | 'done' once the update m
 let liveProgress = null; // the server's per-stage snapshot of the version step in flight
 let liveStepNo = 1; // which version step (multi-version upgrades run one per request)
 let flash = null; // { tone, text }
+let paying = null; // pay_url of the invoice being paid in the popup window
 
 /* ------------------------------------------------------------------ utils */
 
@@ -134,7 +135,7 @@ const unlicensed = () => !!state?.license?.needs_redirect;
 const actionOff = () => (busy || unlicensed() ? 'disabled' : '');
 const unlicensedNote = () => (unlicensed() ? '<p class="sbw-note sbw-bad">Available once the license is valid.</p>' : '');
 
-const hasLicenseTab = () => !!state && (!!state.access?.license || !!state.payment);
+const hasLicenseTab = () => !!state && (!!state.access?.license || !!state.payment || !!state.account?.wallet);
 const hasUpdateTab = () => !!state && (!!state.update || !!state.backup);
 
 function normalizeTab(name) {
@@ -217,6 +218,59 @@ function daysUntil(value) {
     return Math.max(0, Math.ceil((d.getTime() - Date.now()) / 86400000));
 }
 
+// "12 days left" / "Ends today" / "Ended 3 days ago" for a paid-through date.
+function daysLeft(value) {
+    if (!value) return null;
+    const end = new Date(String(value).slice(0, 10) + 'T00:00:00');
+    if (isNaN(end.getTime())) return null;
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const days = Math.round((end.getTime() - today.getTime()) / 86400000);
+    if (days > 1) return { days, text: `${days} days left`, tone: days <= 5 ? 'warn' : 'ok' };
+    if (days === 1) return { days, text: '1 day left', tone: 'warn' };
+    if (days === 0) return { days, text: 'Ends today', tone: 'warn' };
+    return { days, text: `Ended ${-days} day${days === -1 ? '' : 's'} ago`, tone: 'bad' };
+}
+
+// Wallet balance, due, paid-through and "Add funds" — shown even with nothing due.
+function renderAccount(a) {
+    const w = a.wallet;
+    const cur = esc(w?.currency || a.currency || 'BDT');
+    const left = daysLeft(a.paid_through);
+    const due = Number(a.due_amount) || 0;
+    const suggested = amountNeeded(due);
+    const chips = [...new Set([suggested || null, 500, 1000, 2000, 5000].filter(Boolean))];
+
+    return `
+        <section class="sbw-card sbw-account">
+            <div class="sbw-account-hero ${a.late ? 'sbw-account-late' : ''}">
+                <div class="sbw-account-stat">
+                    <span>Wallet balance</span>
+                    <strong>${w ? `${money(w.balance)} <small>${cur}</small>` : '—'}</strong>
+                </div>
+                <div class="sbw-account-stat">
+                    <span>Total due</span>
+                    <strong>${money(due)} <small>${cur}</small></strong>
+                </div>
+                <div class="sbw-account-stat">
+                    <span>${a.plan === 'lifetime' ? 'Updates until' : 'Paid through'}</span>
+                    <strong>${a.paid_through ? date(a.paid_through) : (a.plan === 'lifetime' ? 'Lifetime' : '—')}</strong>
+                    ${left ? `<em class="sbw-days sbw-days-${left.tone}">${esc(left.text)}</em>` : ''}
+                </div>
+            </div>
+            ${w?.deposit_url ? `
+            <form class="sbw-account-pay" data-sbw-form="deposit">
+                <label class="sbw-label" for="sbw-deposit-amount">${due > 0 ? 'Pay the due or add funds' : 'Add funds to your wallet'}</label>
+                <div class="sbw-account-row">
+                    <input id="sbw-deposit-amount" class="sbw-input" type="number" name="amount" min="10" step="0.01" inputmode="decimal" placeholder="Amount (${cur})" value="${esc(suggested)}">
+                    <button class="sbw-btn" type="submit" ${paying ? 'disabled' : ''}>${paying === w.deposit_url ? 'Paying…' : due > 0 ? 'Pay now' : 'Add funds'}</button>
+                </div>
+                <div class="sbw-chips">${chips.map((c) => `<button type="button" class="sbw-chip" data-sbw="deposit-chip" data-amount="${esc(c)}">${c === suggested ? `Needed ${money(c)}` : money(c)}</button>`).join('')}</div>
+                <p class="sbw-muted">Paid securely on the provider's site in a small window. Any due invoices are paid from the wallet automatically.</p>
+            </form>` : ''}
+        </section>`;
+}
+
 // One sentence saying where the client stands and what happens next.
 function paymentHeadline(p) {
     if (p.blocked) return 'Your subscription is paused because a payment is overdue. Pay the due amount to continue.';
@@ -227,7 +281,10 @@ function paymentHeadline(p) {
             ? `Your update subscription payment is late. New versions stop ${when} (${date(p.grace_ends_at)}).`
             : `Your subscription payment is late. Access pauses ${when} (${date(p.grace_ends_at)}) unless it is paid.`;
     }
-    return p.next_due_date ? `Your next payment is due on ${date(p.next_due_date)}.` : 'A payment is due.';
+    // Advance billing: pay by the paid-through date to keep going.
+    const by = p.paid_through || p.next_due_date;
+    const left = daysLeft(by);
+    return by ? `Your subscription is paid through ${date(by)}${left && left.days >= 0 ? ` (${left.text})` : ''}. Pay in advance to continue after that.` : 'A payment is due.';
 }
 
 // Each unpaid invoice with what it is for: `reason` comes from the provider
@@ -245,6 +302,7 @@ function renderInvoices(p) {
             <div class="sbw-invoice-amt">
                 <strong>${money(inv.due_amount)} ${esc(p.currency)}</strong>
                 ${inv.due_date ? `<span class="sbw-muted">due ${date(inv.due_date)}</span>` : ''}
+                ${inv.pay_url ? `<button type="button" class="sbw-btn sbw-btn-sm sbw-pay-now" data-sbw="pay-online" data-url="${esc(inv.pay_url)}" ${paying ? 'disabled' : ''}>${paying === inv.pay_url ? 'Paying…' : 'Pay now'}</button>` : ''}
             </div>
         </div>`).join('')}</div>`;
 }
@@ -286,9 +344,10 @@ function renderLicense() {
     if (!status) return '<section class="sbw-card"><p class="sbw-muted">Loading…</p></section>';
 
     const cells = LICENSE_FIELDS.map(([key, label]) => {
+        const left = key === 'paid_through' ? daysLeft(status[key]) : null;
         const value = key === 'status'
             ? `<span class="sbw-badge sbw-${statusTone(status.status)}">${esc(fmt(status.status))}${status.in_grace_period ? ' (grace)' : ''}</span>`
-            : esc(fmt(status[key]));
+            : esc(fmt(status[key])) + (left ? ` <em class="sbw-days sbw-days-${left.tone}">${esc(left.text)}</em>` : '');
         return `<div><span class="sbw-label">${esc(label)}</span><div class="sbw-value">${value}</div></div>`;
     }).join('');
 
@@ -441,6 +500,7 @@ function render() {
 
     if (tab === 'license') {
         content = [
+            state.account ? renderAccount(state.account) : '',
             state.payment ? renderPayment(state.payment) : '',
             state.access?.license ? renderLicense() : '',
         ].join('');
@@ -663,14 +723,17 @@ function renderPayModal(p) {
             </div>
         </div>
         <div class="sbw-modal-body">
+            ${flash ? `<p class="sbw-flash sbw-${flash.tone}" role="status">${esc(flash.text)}</p>` : ''}
             ${(p.greeting || []).map((g) => `<p>${esc(g)}</p>`).join('')}
             <p>${esc(paymentHeadline(p))}</p>
             ${renderDueBreakdown(p)}
             ${renderInvoices(p)}
+            ${renderPayDueForm(p)}
             ${rows.length ? `<div class="sbw-box"><span class="sbw-label">How to pay</span>${rows.map((r) => `<p>${r}</p>`).join('')}</div>` : ''}
             <div class="sbw-actions">
                 <button type="button" class="sbw-btn sbw-ghost" data-sbw="pay-later">Remind me later</button>
-                ${state.access?.license ? '<button type="button" class="sbw-btn" data-sbw="pay-panel">Subscription details</button>' : ''}
+                ${state.access?.license ? '<button type="button" class="sbw-btn sbw-ghost" data-sbw="pay-panel">Subscription details</button>' : ''}
+                ${!state?.account?.wallet?.deposit_url && payDueTarget(p) ? `<button type="button" class="sbw-btn sbw-btn-lg sbw-pay-due" data-sbw="pay-due" ${paying ? 'disabled' : ''}>${paying ? 'Paying…' : `Pay ${money(p.due_amount)} ${esc(p.currency)}`}</button>` : ''}
             </div>
         </div>`;
 }
@@ -919,6 +982,150 @@ async function saveLicense(value) {
     await loadDetails();
 }
 
+/*
+ * Pays an invoice on the provider's site in a popup window, so the user
+ * never leaves this app. The popup's last page posts
+ * { type: 'subandl-payment-done', success, transaction_id } back here and
+ * closes; then the license is re-checked and the page shows the new status.
+ * Closing the popup early just re-checks, in case it was paid anyway.
+ */
+function payOnline(url, openUrl = url) {
+    if (paying || !url) return;
+
+    const w = 520;
+    const h = 720;
+    const left = Math.max(0, window.screenX + (window.outerWidth - w) / 2);
+    const top = Math.max(0, window.screenY + (window.outerHeight - h) / 2);
+    const popup = window.open(openUrl, 'subandl_payment', `popup=yes,width=${w},height=${h},left=${left},top=${top}`);
+
+    if (!popup) {
+        flash = { tone: 'bad', text: 'Your browser blocked the payment window. Allow pop-ups for this site and try again.' };
+        rerenderAll();
+        return;
+    }
+    popup.focus();
+
+    let origin = '';
+    try {
+        origin = new URL(url, window.location.href).origin;
+    } catch (e) {
+        origin = '';
+    }
+
+    paying = url;
+    flash = { tone: 'info', text: 'Complete the payment in the window that opened…' };
+    rerenderAll();
+
+    let result = null;
+    const onMessage = (event) => {
+        if (event.origin !== origin || event.data?.type !== 'subandl-payment-done') return;
+        result = event.data;
+        // Close the payment window from here too (it also closes itself).
+        try {
+            popup.close();
+        } catch (e) {}
+        finish();
+    };
+    window.addEventListener('message', onMessage);
+    const watcher = setInterval(() => popup.closed && finish(), 700);
+
+    let finished = false;
+    async function finish() {
+        if (finished) return;
+        finished = true;
+        clearInterval(watcher);
+        window.removeEventListener('message', onMessage);
+
+        const wasBlocked = !!state?.payment?.blocked;
+        flash = { tone: 'info', text: 'Checking the payment…' };
+        rerenderAll();
+
+        // Ask the provider again: the payment shows up in the license now.
+        const r = await api.refreshLicense();
+        if (r.ok) status = r.data;
+        await refresh(true);
+        paying = null;
+
+        if (result?.success) {
+            const amt = result.amount ? ` ${money(result.amount)} ${esc(state?.account?.wallet?.currency || '')}`.trimEnd() : '';
+            flash = { tone: 'ok', text: `Payment of${amt || ' the amount'} received${result.transaction_id ? `. Transaction ID: ${result.transaction_id}` : ''}.` };
+        } else if (result) {
+            flash = { tone: 'bad', text: result.message || 'The payment was not completed.' };
+        } else {
+            flash = state?.payment ? null : { tone: 'ok', text: 'Payment received.' };
+        }
+
+        // Paid: the reminder popup closes (the panel keeps the new status and
+        // the message). Only "Remind me later"'s pause applies to it again.
+        if (result?.success || !state?.payment) {
+            payModal.hidden = true;
+            snooze(DUE_SNOOZE_KEY, (cfg.reminderMinutes || 10) * 60000);
+        }
+        rerenderAll();
+
+        // Access was paused and is back: carry on where the app was.
+        if (wasBlocked && state && !state.payment?.blocked && !state.license?.needs_redirect && pageMode && state.urls?.home) {
+            window.location.assign(state.urls.home);
+        }
+    }
+}
+
+// What still has to be paid: the due minus what the wallet already holds
+// (the wallet pays dues first). At least 10, the gateway minimum; '' when
+// the wallet already covers it.
+function amountNeeded(due) {
+    const balance = Math.max(0, Number(state?.account?.wallet?.balance) || 0);
+    const need = Math.round(((Number(due) || 0) - balance) * 100) / 100;
+    return need <= 0 ? '' : Math.max(10, need);
+}
+
+// The reminder popup's "pay online" box: an editable amount, pre-filled with
+// what is still needed after the wallet balance.
+function renderPayDueForm(p) {
+    const w = state?.account?.wallet;
+    if (!w?.deposit_url) return '';
+    const cur = esc(w.currency || p.currency || 'BDT');
+    const balance = Number(w.balance) || 0;
+    const need = amountNeeded(p.due_amount);
+
+    return `
+        <form class="sbw-paydue" data-sbw-form="deposit">
+            <label class="sbw-label" for="sbw-paydue-amount">Pay online</label>
+            <div class="sbw-account-row">
+                <input id="sbw-paydue-amount" class="sbw-input" type="number" name="amount" min="10" step="0.01" inputmode="decimal" value="${esc(need)}" placeholder="Amount (${cur})">
+                <button class="sbw-btn sbw-btn-lg sbw-pay-due" type="submit" ${paying ? 'disabled' : ''}>${paying ? 'Paying…' : 'Pay now'}</button>
+            </div>
+            <p class="sbw-muted">${balance > 0
+                ? `Due ${money(p.due_amount)} ${cur} − wallet ${money(balance)} ${cur} = ${need ? `${money(need)} ${cur} to pay` : 'already covered by the wallet'}. You can change the amount.`
+                : 'You can change the amount; anything extra stays in your wallet for the next month.'}</p>
+        </form>`;
+}
+
+// "Pay now" for the whole due: into the wallet (it pays the due invoices
+// from there, oldest first), or — from a provider without wallet links —
+// the oldest invoice's own link.
+function payDueTarget(p) {
+    const due = Number(p?.due_amount) || 0;
+    const wallet = state?.account?.wallet?.deposit_url;
+    if (wallet && due > 0) return { key: wallet, url: direct(wallet, { amount: amountNeeded(due) || due }) };
+    const inv = (p?.invoices || []).find((i) => i.pay_url);
+    return inv ? { key: inv.pay_url, url: direct(inv.pay_url, { pay: 1 }) } : null;
+}
+
+// A provider pay link plus what makes it skip the provider's own page and
+// open the payment gateway at once (`amount` for the wallet, `pay` for an invoice).
+// Older providers ignore these and show their page, as before.
+function direct(url, params) {
+    const q = Object.entries(params).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&');
+    return url + (url.includes('?') ? '&' : '?') + q;
+}
+
+// Panel and (when open) the payment popup show the same invoice list.
+function rerenderAll() {
+    render();
+    if (!payModal.hidden && state?.payment) renderPayModal(state.payment);
+}
+
 async function refreshLicense() {
     if (busy) return;
     busy = 'license';
@@ -994,10 +1201,45 @@ root.addEventListener('click', (event) => {
         case 'refresh-license':
             refreshLicense();
             break;
+        case 'pay-due': {
+            const target = payDueTarget(state?.payment);
+            if (target) payOnline(target.key, target.url);
+            break;
+        }
+        case 'pay-online': {
+            const url = event.target.closest('[data-sbw]').dataset.url;
+            payOnline(url, direct(url, { pay: 1 }));
+            break;
+        }
+        case 'deposit-chip': {
+            const input = root.querySelector('#sbw-deposit-amount');
+            if (input) {
+                input.value = event.target.closest('[data-sbw]').dataset.amount;
+                input.focus();
+            }
+            break;
+        }
     }
 });
 
 root.addEventListener('submit', (event) => {
+    const deposit = event.target.closest('[data-sbw-form="deposit"]');
+    if (deposit) {
+        event.preventDefault();
+        const amount = Number(deposit.elements.amount.value);
+        const url = state?.account?.wallet?.deposit_url;
+        if (!url) return;
+        if (!(amount >= 10)) {
+            flash = { tone: 'bad', text: 'Enter an amount of at least 10.' };
+            render();
+            return;
+        }
+        // The provider signs the link without `amount`, so adding it keeps the
+        // link valid; with it, the window goes straight to the payment gateway.
+        payOnline(url, direct(url, { amount }));
+        return;
+    }
+
     const form = event.target.closest('[data-sbw-form="license"]');
     if (!form) return;
     event.preventDefault();

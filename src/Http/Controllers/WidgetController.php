@@ -65,6 +65,9 @@ class WidgetController extends Controller
             // Only while something is owed or the payment is late — no due, no card.
             'payment' => $this->payment($state),
 
+            // Always: wallet balance, paid-through date and the link to add funds.
+            'account' => $this->account($state),
+
             'update' => $canUpdate ? [
                 'available' => $notice['available'],
                 'latest_version' => $notice['latest_version'],
@@ -95,6 +98,35 @@ class WidgetController extends Controller
                 'next_at' => $backups->nextDueAt($state)->toDateTimeString(),
             ] : null,
         ]);
+    }
+
+    /**
+     * The account summary on top of the Subscription tab, shown whether or
+     * not anything is due: wallet balance (the provider sends it inside
+     * `billing`), total due, paid-through date, and a signed link to add
+     * money to the wallet online, which also pays due invoices.
+     *
+     * @return array<string, mixed>
+     */
+    private function account(LicenseState $state): array
+    {
+        $billing = $state->billing();
+        $wallet = is_array($billing['wallet'] ?? null) ? $billing['wallet'] : null;
+        $currency = $billing['currency'] ?? ($state->payment_info['currency'] ?? 'BDT');
+
+        return [
+            'plan' => $billing['plan'] ?? $state->subscription_type,
+            // Advance billing: this is also when the next payment is due.
+            'paid_through' => $billing['paid_through'] ?? optional($state->expires_at)->toDateString(),
+            'due_amount' => $state->totalDue(),
+            'currency' => $currency,
+            'late' => $state->isPaymentLate() || $state->status === 'expired',
+            'wallet' => $wallet ? [
+                'balance' => (float) ($wallet['balance'] ?? 0),
+                'currency' => $wallet['currency'] ?? $currency,
+                'deposit_url' => $wallet['deposit_url'] ?? null,
+            ] : null,
+        ];
     }
 
     /**
@@ -129,6 +161,7 @@ class WidgetController extends Controller
             'next_due_date' => $billing['next_due_date'] ?? null,
             'paid_through' => $billing['paid_through'] ?? optional($state->expires_at)->toDateString(),
             'expires_at' => optional($state->expires_at)->toDateTimeString(),
+            // Each may carry a `pay_url` (provider's signed link to pay it online in a popup).
             'invoices' => array_values((array) ($billing['invoices'] ?? [])),
             'greeting' => array_values((array) config('subandl.widget.payment_greeting', [])),
         ];

@@ -309,12 +309,13 @@ export const LICENSE_FIELDS = [
     ['status', 'Status'],
     ['client_name', 'Client'],
     ['subscription_type', 'Plan'],
+    // Advance billing: the paid-through date is when the next payment is due,
+    // so it is the only date shown (no separate "next due date").
     ['paid_through', 'Paid through'],
     ['monthly_fee', 'Monthly fee'],
     ['fee_due', 'Subscription fee due'],
     ['other_due', 'Other dues'],
     ['due_amount', 'Total due'],
-    ['next_due_date', 'Next due date'],
     ['last_verified_at', 'Last verified'],
 ];
 

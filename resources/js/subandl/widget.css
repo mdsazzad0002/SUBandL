@@ -269,3 +269,49 @@ html.sbw-noscroll, html.sbw-noscroll body { overflow: hidden !important; }
     .sbw-bar span { transition: none; }
     .sbw-bar-busy span { animation-duration: 4s; }
 }
+
+/* "Pay now" under an invoice's amount: pays it online in a popup window. */
+.sbw-invoice-amt .sbw-pay-now { margin-top: 6px; }
+
+/* Account summary: wallet, due, paid-through and "Add funds" (always shown). */
+.sbw-account { padding: 0; overflow: hidden; grid-column: 1 / -1; }
+.sbw-account-hero {
+    display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; padding: 18px 20px; color: #fff;
+    background: linear-gradient(135deg, #2563eb 0%, #7c3aed 100%);
+}
+.sbw-account-hero.sbw-account-late { background: linear-gradient(135deg, #b91c1c 0%, #ea580c 100%); }
+.sbw-account-stat span { display: block; font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; opacity: .85; }
+.sbw-account-stat strong { display: block; margin-top: 2px; font-size: 22px; font-weight: 800; line-height: 1.2; }
+.sbw-account-stat strong small { font-size: 12px; font-weight: 600; opacity: .85; }
+.sbw-account-stat .sbw-days { margin-top: 6px; background: rgba(255, 255, 255, .2); color: #fff; }
+.sbw-account-pay { padding: 14px 20px 16px; }
+.sbw-account-pay .sbw-label { margin-bottom: 6px; }
+.sbw-account-row { display: flex; gap: 8px; }
+.sbw-account-row .sbw-input { flex: 1; min-width: 0; font-size: 15px; font-weight: 600; }
+.sbw-account-row .sbw-btn { flex-shrink: 0; min-width: 120px; }
+.sbw-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 8px; }
+.sbw-chip {
+    padding: 4px 12px; border: 1px solid var(--sbw-line); border-radius: 999px; background: var(--sbw-soft);
+    color: var(--sbw-text); font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer;
+}
+.sbw-chip:hover { border-color: var(--sbw-primary); color: var(--sbw-primary); }
+.sbw-account-pay .sbw-muted { margin: 0; font-size: 12px; }
+.sbw-days {
+    display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11.5px; font-style: normal; font-weight: 700; white-space: nowrap;
+}
+.sbw-days-ok { color: var(--sbw-ok); background: var(--sbw-ok-bg); }
+.sbw-days-warn { color: var(--sbw-warn); background: var(--sbw-warn-bg); }
+.sbw-days-bad { color: var(--sbw-bad); background: var(--sbw-bad-bg); }
+@media (max-width: 640px) {
+    .sbw-account-hero { grid-template-columns: 1fr 1fr; }
+    .sbw-account-stat:last-child { grid-column: 1 / -1; }
+    .sbw-account-row { flex-direction: column; }
+}
+
+/* The reminder popup's main action: pay the due online. */
+.sbw-pay-due { background: #16a34a; color: #fff; }
+.sbw-pay-due:hover { filter: brightness(1.08); }
+
+.sbw-paydue { margin: 4px 0 12px; padding: 12px; border: 1px solid var(--sbw-line); border-radius: 12px; background: var(--sbw-soft); }
+.sbw-paydue .sbw-label { margin-bottom: 6px; }
+.sbw-paydue .sbw-muted { margin: 8px 0 0; font-size: 12px; }
