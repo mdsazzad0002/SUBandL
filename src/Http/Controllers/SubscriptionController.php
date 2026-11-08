@@ -365,6 +365,12 @@ class SubscriptionController extends Controller
                 return $this->updateChunk($run, $client, $applier);
             }
 
+            // This run already finished; its last response was cut off (the server
+            // restarts when the update writes the new version into .env).
+            if ($finished = $applier->finishedResult($run)) {
+                return $this->updateFinished($finished, [], $client);
+            }
+
             // Another browser (or tab) is in the middle of one.
             if ($applier->activeJob()) {
                 return response()->json(['status' => false, 'running' => true, 'message' => 'A software update is already running.'], 409);

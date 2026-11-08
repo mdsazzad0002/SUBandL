@@ -44,6 +44,9 @@ class UpdateApplier
     /** Folders already known to exist during this merge. @var array<string, true> */
     private array $knownDirs = [];
 
+    /** Where this package itself lives in a release's vendor/. */
+    private const SELF_DIR = 'vendor/subandl/subandl/';
+
     /** config('subandl.update.protected_paths'), read once per process. @var list<string>|null */
     private ?array $protectedPaths = null;
 
@@ -64,6 +67,16 @@ class UpdateApplier
         $state ??= LicenseState::current();
 
         if (! $state->update_running) {
+            return false;
+        }
+
+        // The flag is on but no update job exists any more (its process died
+        // after the job ended, or an older version left it): nothing is
+        // running, so don't make everyone wait out stale_minutes.
+        if ($this->loadJob() === null && $state->update_started_at && $state->update_started_at->lt(now()->subMinute())) {
+            LicenseState::query()->whereKey($state->getKey())->where('update_running', true)->update(['update_running' => false]);
+            $state->forceFill(['update_running' => false])->save();
+
             return false;
         }
 
@@ -191,9 +204,45 @@ class UpdateApplier
             return ['finished' => false];
         }
 
+        // Everything is recorded BEFORE .env changes: `php artisan serve` restarts
+        // the moment .env is modified, killing this request — the outcome must
+        // already be saved by then (it used to be lost, leaving the update
+        // "running" for 30 minutes while the browser retried the last chunk,
+        // whose .env write restarted the server again each time).
+        $result = $this->finish($job, $result);
+        $this->saveLastRun($run, $result);
         $this->clearJob();
 
-        return ['finished' => true, 'result' => $this->finish($job, $result)];
+        if (($result['ok'] ?? false) && ! empty($job['info']['latest_version'])) {
+            $this->updateEnvVersion((string) $job['info']['latest_version']);
+        }
+
+        return ['finished' => true, 'result' => $result];
+    }
+
+    /**
+     * The outcome of $run when that job has already finished — for a browser
+     * whose last chunk request was cut off (the server restarted on the .env
+     * change) and asks again.
+     */
+    public function finishedResult(string $run): ?array
+    {
+        $last = json_decode((string) @file_get_contents($this->lastRunPath()), true);
+
+        return $run !== '' && is_array($last) && ($last['run'] ?? null) === $run && is_array($last['result'] ?? null)
+            ? $last['result']
+            : null;
+    }
+
+    private function saveLastRun(string $run, array $result): void
+    {
+        unset($result['migration_output'], $result['commands_output']);
+        @file_put_contents($this->lastRunPath(), json_encode(['run' => $run, 'result' => $result, 'at' => time()]));
+    }
+
+    private function lastRunPath(): string
+    {
+        return $this->stagingDir() . DIRECTORY_SEPARATOR . 'last-run.json';
     }
 
     /**
@@ -345,9 +394,7 @@ class UpdateApplier
                     }
 
                     $info = $job['info'];
-                    if (! empty($info['latest_version'])) {
-                        $this->updateEnvVersion((string) $info['latest_version']);
-                    }
+                    // .env (the new version number) is written by step(), last of all.
                     UpdateProgress::done('migrate', $job['migrate_summary'] ?? 'Done.');
 
                     return [
@@ -1250,11 +1297,12 @@ class UpdateApplier
 
         // Pass 1: find what actually changed.
         if (! $cursor['compare_done']) {
+            $cursor['keep_self'] ??= $this->olderSelfInPackage($zip);
             $entries = [];
             for ($i = 0; $i < $zip->numFiles; $i++) {
                 $stat = $zip->statIndex($i);
                 $relative = $stat === false ? null : $this->safeRelativePath($stat['name']);
-                if ($relative !== null) {
+                if ($relative !== null && ! ($cursor['keep_self'] && str_starts_with($relative, self::SELF_DIR))) {
                     $entries[] = [$i, $stat, $relative];
                 }
             }
@@ -1340,6 +1388,48 @@ class UpdateApplier
         $this->saveManifest($destination, $manifest, $seen);
 
         return ['ok' => true, 'extracted' => $cursor['written'] + $cursor['unchanged'], 'written' => $cursor['written'], 'unchanged' => $cursor['unchanged']];
+    }
+
+    /**
+     * Whether the release carries an OLDER copy of this package than the one
+     * running. Merging it would swap the updater for one that does not know
+     * this job mid-update (the next chunk then runs the old code: the update
+     * never finishes and stays "running"), and the old code cannot read the
+     * cache as the new one left it. Such a copy is left out — the installed
+     * updater stays. A newer copy is merged as usual (it reads this job).
+     */
+    /** The installed version of this package (Composer's own record), or null. */
+    protected function installedSelfVersion(): ?string
+    {
+        try {
+            return \Composer\InstalledVersions::getPrettyVersion('subandl/subandl');
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    private function olderSelfInPackage(ZipArchive $zip): bool
+    {
+        $running = $this->installedSelfVersion();
+
+        $json = $zip->getFromName('vendor/composer/installed.json');
+        $data = is_string($json) ? json_decode($json, true) : null;
+        $packaged = null;
+        foreach ((array) ($data['packages'] ?? $data ?? []) as $package) {
+            if (is_array($package) && ($package['name'] ?? null) === 'subandl/subandl') {
+                $packaged = (string) ($package['version'] ?? '');
+            }
+        }
+
+        $semver = '/^v?\d+\.\d+\.\d+$/';
+        if (! $running || ! $packaged || ! preg_match($semver, $running) || ! preg_match($semver, $packaged)
+            || ! version_compare(ltrim($packaged, 'v'), ltrim($running, 'v'), '<')) {
+            return false;
+        }
+
+        ActivityLog::record('update', true, "The release carries SUBandL {$packaged}, older than the installed {$running}: kept {$running} (vendor/subandl/subandl was not overwritten).");
+
+        return true;
     }
 
     /**
@@ -1571,11 +1661,15 @@ class UpdateApplier
         $line = $key . '=' . $version;
         $pattern = '/^' . preg_quote($key, '/') . '=[^\r\n]*/m';
 
-        $content = preg_match($pattern, $content)
+        $updated = preg_match($pattern, $content)
             ? preg_replace($pattern, $line, $content)
             : rtrim($content) . $eol . $line . $eol;
 
-        file_put_contents($envPath, $content);
+        // Unchanged: leave the file (and its mtime) alone — `php artisan serve`
+        // restarts on every .env modification.
+        if ($updated !== $content) {
+            file_put_contents($envPath, $updated);
+        }
     }
 
     /**
