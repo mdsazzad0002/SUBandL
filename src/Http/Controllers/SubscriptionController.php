@@ -320,10 +320,16 @@ class SubscriptionController extends Controller
     }
 
     /**
-     * Applies exactly ONE version step per call and reports whether another is
-     * available, so the frontend drives a multi-version upgrade step by step
-     * instead of one long request that can die mid-chain. Each stage's live
-     * percentage is published through UpdateProgress (read by updateStatus).
+     * Applies exactly ONE version step, and reports whether another is
+     * available, so the frontend drives a multi-version upgrade step by step.
+     *
+     * Each version step is itself chunked: one call does at most
+     * update.chunk_seconds of work and answers `continue: true`, and the
+     * browser calls again with the same `run` until the step is finished.
+     * No request lives long enough for a FastCGI / proxy timeout (Laragon,
+     * WAMP, IIS), and a single-threaded server (`php artisan serve` on
+     * Windows) gets to answer between chunks. A call without `run` (an old
+     * client) still does the whole step in one request.
      *
      * Avoids repeat round trips: a provider probe that succeeded within the
      * last minute (the modal's preflight) is not repeated, and the "is there
@@ -335,9 +341,16 @@ class SubscriptionController extends Controller
             return $denied;
         }
 
+        $run = is_string($request->input('run')) ? mb_substr($request->input('run'), 0, 40) : '';
         $lock = Cache::lock(SUBandL::UPDATE_LOCK, 30 * 60);
 
         if (! $lock->get()) {
+            // The previous chunk of this same run is still being processed
+            // (its request outlived the browser's patience): just come back.
+            if ($applier->hasJob($run)) {
+                return response()->json(['status' => true, 'continue' => true, 'waiting' => true, 'progress' => UpdateProgress::get()], 202);
+            }
+
             return response()->json([
                 'status' => false,
                 'running' => true,
@@ -347,11 +360,19 @@ class SubscriptionController extends Controller
 
         Platform::allowLongRunning();
 
-        $fromVersion = (string) config('subandl.version', '1.0.0');
-        $run = $request->input('run');
-        UpdateProgress::start($fromVersion, null, is_string($run) ? mb_substr($run, 0, 40) : null);
-
         try {
+            if ($applier->hasJob($run)) {
+                return $this->updateChunk($run, $client, $applier);
+            }
+
+            // Another browser (or tab) is in the middle of one.
+            if ($applier->activeJob()) {
+                return response()->json(['status' => false, 'running' => true, 'message' => 'A software update is already running.'], 409);
+            }
+
+            $fromVersion = (string) config('subandl.version', '1.0.0');
+            UpdateProgress::start($fromVersion, null, $run !== '' ? $run : null);
+
             // Health-check the provider before touching files or the database.
             UpdateProgress::stage('check', 10, 'Contacting the update server…');
             $health = app(ServerHealth::class);
@@ -404,38 +425,66 @@ class SubscriptionController extends Controller
             }
 
             UpdateProgress::done('check', 'v' . $result['latest_version'] . ' found.');
-            $applied = $applier->downloadAndApply($result);
-            $stepToVersion = $applied['version'] ?? $result['latest_version'] ?? null;
 
-            if (! ($applied['ok'] ?? false)) {
-                return response()->json([
-                    'status' => false,
-                    'extracted' => (bool) ($applied['extracted'] ?? false),
-                    'update_available' => false,
-                    'message' => $applied['message'] ?? 'Update failed.',
-                    'version' => $fromVersion,
-                ], 422);
+            if ($run === '') {
+                return $this->updateFinished($applier->downloadAndApply($result), $result, $client);
             }
 
-            $next = $client->checkForUpdate((string) $stepToVersion);
-            $updateAvailable = ($next['ok'] ?? false) && ($next['update_available'] ?? false);
-            if ($updateAvailable) {
-                // Short-lived: download URLs may be signed.
-                unset($next['raw']);
-                Cache::put(self::NEXT_UPDATE_KEY, ['from' => (string) $stepToVersion, 'result' => $next], now()->addMinutes(2));
-            }
+            unset($result['raw']);
+            $applier->begin($run, $result);
 
-            return response()->json([
-                'status' => true,
-                'extracted' => true,
-                'update_available' => $updateAvailable,
-                'next_version' => $updateAvailable ? ($next['latest_version'] ?? null) : null,
-                'message' => "Update v{$stepToVersion} applied successfully.",
-                'version' => $stepToVersion,
-            ]);
+            return $this->updateChunk($run, $client, $applier);
         } finally {
             $lock->release();
         }
+    }
+
+    /** One chunk of the job; the finished step's answer once it is done. */
+    private function updateChunk(string $run, LicenseClient $client, UpdateApplier $applier)
+    {
+        $step = $applier->step($run, (float) config('subandl.update.chunk_seconds', 10));
+
+        if (! $step['finished']) {
+            return response()->json(['status' => true, 'continue' => true, 'progress' => UpdateProgress::current()]);
+        }
+
+        return $this->updateFinished($step['result'], [], $client);
+    }
+
+    private function updateFinished(array $applied, array $checked, LicenseClient $client)
+    {
+        $fromVersion = (string) ($applied['from_version'] ?? config('subandl.version', '1.0.0'));
+        $stepToVersion = $applied['version'] ?? $checked['latest_version'] ?? null;
+
+        if (! ($applied['ok'] ?? false)) {
+            return response()->json([
+                'status' => false,
+                'running' => (bool) ($applied['running'] ?? false),
+                'extracted' => (bool) ($applied['extracted'] ?? false),
+                'update_available' => false,
+                'message' => $applied['message'] ?? 'Update failed.',
+                'version' => $fromVersion,
+                'progress' => UpdateProgress::current(),
+            ], ($applied['running'] ?? false) ? 409 : 422);
+        }
+
+        $next = $client->checkForUpdate((string) $stepToVersion);
+        $updateAvailable = ($next['ok'] ?? false) && ($next['update_available'] ?? false);
+        if ($updateAvailable) {
+            // Short-lived: download URLs may be signed.
+            unset($next['raw']);
+            Cache::put(self::NEXT_UPDATE_KEY, ['from' => (string) $stepToVersion, 'result' => $next], now()->addMinutes(2));
+        }
+
+        return response()->json([
+            'status' => true,
+            'extracted' => true,
+            'update_available' => $updateAvailable,
+            'next_version' => $updateAvailable ? ($next['latest_version'] ?? null) : null,
+            'message' => "Update v{$stepToVersion} applied successfully.",
+            'version' => $stepToVersion,
+            'progress' => UpdateProgress::current(),
+        ]);
     }
 
     /**

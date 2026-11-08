@@ -52,6 +52,34 @@ class UpdateProgress
         return self::$data !== null;
     }
 
+    /**
+     * Picks the snapshot up again in the next chunk request of the same run
+     * (each chunk of a chunked update is its own PHP process).
+     */
+    public static function resume(string $run): void
+    {
+        if (self::$data !== null) {
+            return;
+        }
+
+        $data = self::get();
+        if ($data !== null && ($data['run'] ?? null) === $run) {
+            self::$data = $data;
+        }
+    }
+
+    /** The latest snapshot, written out first (a throttled write may be pending). */
+    public static function current(): ?array
+    {
+        if (self::$data !== null) {
+            self::flush();
+
+            return self::$data;
+        }
+
+        return self::get();
+    }
+
     public static function target(?string $toVersion): void
     {
         if (self::$data === null) {
@@ -148,7 +176,8 @@ class UpdateProgress
             return;
         }
 
-        // Temp file + rename, so a poll never reads half a file.
+        // Temp file + rename, so a poll never reads half a file. On Windows
+        // rename() fails while a poll has the file open — then write in place.
         $temp = $path . '.' . getmypid() . '.tmp';
         if (@file_put_contents($temp, json_encode(self::$data)) === false || ! @rename($temp, $path)) {
             @unlink($temp);

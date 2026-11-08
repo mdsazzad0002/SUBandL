@@ -299,6 +299,15 @@ return [
         'download_timeout' => 300,
         'run_migrations' => true,
 
+        // The browser applies an update in short requests of about this many
+        // seconds each (download slices, merge, migrations, commands), so no
+        // request runs into a web server / FastCGI timeout (Laragon, WAMP,
+        // IIS: 30-60s) and a single-threaded `php artisan serve` on Windows
+        // can still answer the progress bar. The CLI/scheduler runs in one go.
+        'chunk_seconds' => (int) env('SUBANDL_UPDATE_CHUNK_SECONDS', 10),
+        // The package is downloaded in HTTP Range slices of this size.
+        'download_chunk_bytes' => 8 * 1024 * 1024,
+
         // A backup already running when an update starts (scheduler, the
         // "Backup now" button) is waited for this long instead of rejecting
         // the update; when it succeeds it counts as the pre-update backup.

@@ -22,6 +22,9 @@ use ZipArchive;
  * Each stage (backup, download, merge, migrate) publishes its own percentage
  * through UpdateProgress while it runs.
  *
+ * Runs as a resumable job (staging/job.json): the browser drives it one
+ * short request at a time (see begin()/step()), the CLI in one go.
+ *
  * Kept fast on purpose: a package already downloaded (and verified) by an
  * earlier attempt is reused, and the merge skips every file whose content is
  * already identical (same size + CRC32), so only what changed is written.
@@ -33,6 +36,9 @@ use ZipArchive;
 class UpdateApplier
 {
     private const CORRUPT = 'the archive entry is corrupt';
+
+    /** Seconds without a chunk before a browser-driven job counts as abandoned. */
+    private const JOB_IDLE_SECONDS = 120;
 
     /** Folders already known to exist during this merge. @var array<string, true> */
     private array $knownDirs = [];
@@ -76,30 +82,308 @@ class UpdateApplier
         return true;
     }
 
+    /**
+     * The whole step in one go — the scheduler, the facade and the CLI, where
+     * no web server timeout applies. Same job as the browser's, just with no
+     * time budget, so both paths share every stage.
+     */
     public function downloadAndApply(array $updateInfo): array
     {
-        $fromVersion = (string) config('subandl.version', '1.0.0');
-
-        LicenseState::current()->forceFill(['update_running' => true, 'update_started_at' => now()])->save();
+        if ($this->activeJob()) {
+            return ['ok' => false, 'running' => true, 'message' => 'An update is already being installed from the browser.'];
+        }
 
         // The scheduler / facade path has no check stage of its own.
         if (! UpdateProgress::active()) {
-            UpdateProgress::start($fromVersion, $updateInfo['latest_version'] ?? null);
+            UpdateProgress::start((string) config('subandl.version', '1.0.0'), $updateInfo['latest_version'] ?? null);
             UpdateProgress::done('check', 'v' . ($updateInfo['latest_version'] ?? '?') . ' found.');
         }
+
+        $run = 'cli-' . bin2hex(random_bytes(4));
+        $this->begin($run, $updateInfo);
+
+        do {
+            $step = $this->step($run);
+        } while (! $step['finished']);
+
+        return $step['result'];
+    }
+
+    /**
+     * Opens a resumable update job for one version step. The browser then
+     * calls step() once per request until it reports finished — each call
+     * does at most chunk_seconds of work, so no single request runs into a
+     * web server / FastCGI timeout (Laragon, WAMP, IIS: 30–60s), and a
+     * single-threaded server (`php artisan serve` on Windows) answers the
+     * progress poll between chunks instead of only at the very end.
+     */
+    public function begin(string $run, array $updateInfo): void
+    {
+        LicenseState::current()->forceFill(['update_running' => true, 'update_started_at' => now()])->save();
         UpdateProgress::target($updateInfo['latest_version'] ?? null);
 
+        $this->saveJob([
+            'format' => 1,
+            'run' => $run,
+            'phase' => 'backup',
+            'info' => $updateInfo,
+            'from_version' => (string) config('subandl.version', '1.0.0'),
+            'touched_at' => time(),
+        ]);
+    }
+
+    /** Whether $run is the job in progress (the browser's next chunk). */
+    public function hasJob(string $run): bool
+    {
+        $job = $this->loadJob();
+
+        return $run !== '' && $job !== null && ($job['run'] ?? null) === $run;
+    }
+
+    /**
+     * The job a browser is driving right now — one that had a chunk within
+     * the last two minutes. An older one was abandoned (tab closed) and may
+     * be replaced by a new run; everything it did is safe to redo.
+     */
+    public function activeJob(): ?array
+    {
+        $job = $this->loadJob();
+
+        return $job !== null && (int) ($job['touched_at'] ?? 0) >= time() - self::JOB_IDLE_SECONDS ? $job : null;
+    }
+
+    /**
+     * Advances the job by up to $budgetSeconds (null: until it is done).
+     *
+     * @return array{finished: bool, result?: array}
+     */
+    public function step(string $run, ?float $budgetSeconds = null): array
+    {
+        $job = $this->loadJob();
+        if ($job === null || ($job['run'] ?? null) !== $run) {
+            return ['finished' => true, 'result' => ['ok' => false, 'message' => 'This update is no longer in progress. Start it again.']];
+        }
+
+        UpdateProgress::resume($run);
+        // Heartbeat: a chunked update outlasting stale_minutes is still alive.
+        LicenseState::current()->forceFill(['update_running' => true, 'update_started_at' => now()])->save();
+
+        $deadline = $budgetSeconds === null ? INF : microtime(true) + max(0.01, $budgetSeconds);
+
         try {
-            $result = $this->applyUpdate($updateInfo);
+            $result = $this->advance($job, $deadline);
         } catch (\Throwable $e) {
             $result = ['ok' => false, 'message' => 'Update failed: ' . $e->getMessage()];
             UpdateProgress::failCurrent($result['message']);
-        } finally {
-            LicenseState::current()->forceFill(['update_running' => false])->save();
         }
 
+        if ($result === null) {
+            $job['touched_at'] = time();
+            $this->saveJob($job);
+
+            return ['finished' => false];
+        }
+
+        $this->clearJob();
+
+        return ['finished' => true, 'result' => $this->finish($job, $result)];
+    }
+
+    /**
+     * Runs stages until the job is done (the result) or the budget is used up
+     * (null). Backup and migrations cannot be split, so each starts in a
+     * request of its own with the full budget ahead of it.
+     */
+    private function advance(array &$job, float $deadline): ?array
+    {
+        $chunked = $deadline !== INF;
+        $worked = false;
+
+        while (true) {
+            if ($worked && microtime(true) >= $deadline) {
+                return null;
+            }
+
+            switch ($job['phase']) {
+                case 'backup':
+                    if (empty($job['info']['download_url'])) {
+                        UpdateProgress::fail('download', 'No download URL provided.');
+
+                        return ['ok' => false, 'message' => 'No download URL provided by update server.'];
+                    }
+
+                    // Not forced — only actually backs up when one is due (or none ever ran).
+                    $backup = $this->preUpdateBackup($job, $deadline);
+                    if ($backup === null) {
+                        return null;
+                    }
+                    if (! ($backup['ok'] ?? false)) {
+                        UpdateProgress::fail('backup', $backup['message'] ?? 'Backup failed.');
+
+                        return ['ok' => false, 'message' => 'Aborting update: pre-update backup failed. ' . ($backup['message'] ?? '')];
+                    }
+                    $job['backup_id'] = $backup['backup_id'] ?? null;
+                    ($backup['skipped'] ?? false)
+                        ? UpdateProgress::skip('backup', $backup['message'] ?? 'Not due.')
+                        : UpdateProgress::done('backup', 'Backup uploaded.');
+
+                    if (! class_exists(ZipArchive::class)) {
+                        UpdateProgress::fail('download', 'The PHP zip extension is not enabled.');
+
+                        return ['ok' => false, 'message' => 'The PHP zip extension is not enabled. Enable it in php.ini (extension=zip) and restart the web server.'];
+                    }
+
+                    $stagingDir = $this->stagingDir();
+                    if (! is_dir($stagingDir) && ! @mkdir($stagingDir, 0755, true) && ! is_dir($stagingDir)) {
+                        UpdateProgress::fail('download', 'Could not create the staging folder.');
+
+                        return ['ok' => false, 'message' => "Could not create the update staging folder '{$stagingDir}'."];
+                    }
+
+                    $job['phase'] = 'download';
+                    break;
+
+                case 'download':
+                    $download = $this->fetchPackage($job, $deadline);
+                    if ($download === null) {
+                        return null;
+                    }
+                    if (! $download['ok']) {
+                        UpdateProgress::fail('download', $download['message']);
+
+                        return ['ok' => false, 'message' => $download['message']];
+                    }
+                    $job['phase'] = 'merge';
+                    break;
+
+                case 'merge':
+                    $merge = $this->mergePackage($job, $deadline);
+                    if ($merge === null) {
+                        return null;
+                    }
+                    if (! $merge['ok']) {
+                        UpdateProgress::fail('merge', $merge['message']);
+
+                        return [
+                            'ok' => false,
+                            'extracted' => ($merge['extracted'] ?? 0) > 0,
+                            'message' => isset($merge['extracted'])
+                                ? 'Update package did not extract cleanly: ' . $merge['message']
+                                : $merge['message'],
+                            'backup_path' => $job['backup_id'] ?? null,
+                        ];
+                    }
+
+                    $job['removed'] = $this->applyRemoveManifest();
+                    UpdateProgress::done('merge', $this->mergeSummary($merge) . ($job['removed'] ? ', ' . count($job['removed']) . ' removed' : '') . '.');
+                    $job['phase'] = 'migrate';
+                    break;
+
+                case 'migrate':
+                    if ($chunked && $worked) {
+                        return null;
+                    }
+
+                    $job['commands'] = array_values(array_filter(array_merge(
+                        is_array($job['info']['commands'] ?? null) ? $job['info']['commands'] : [],
+                        (array) config('subandl.update.after_update_commands', []),
+                    ), fn ($c) => is_string($c) && trim($c) !== ''));
+
+                    $migration = $this->runMigrations(count($job['commands']) > 0);
+                    $job['migration_output'] = mb_substr($migration['output'], -20000);
+                    if (! $migration['ok']) {
+                        UpdateProgress::fail('migrate', $migration['message']);
+
+                        return [
+                            'ok' => false,
+                            'extracted' => true,
+                            'message' => 'Update files applied but migrations failed: ' . $migration['message'],
+                            'backup_path' => $job['backup_id'] ?? null,
+                            'migration_output' => $job['migration_output'],
+                        ];
+                    }
+
+                    $job['migrate_summary'] = $migration['summary'];
+                    $job['command_index'] = 0;
+                    $job['commands_output'] = '';
+                    $job['phase'] = 'commands';
+                    break;
+
+                case 'commands':
+                    $commands = $job['commands'] ?? [];
+                    $ranOne = false;
+                    while ($job['command_index'] < count($commands)) {
+                        if ($chunked && ($worked || $ranOne) && microtime(true) >= $deadline) {
+                            return null;
+                        }
+
+                        $command = $commands[$job['command_index']];
+                        UpdateProgress::stage('migrate', 85 + 15 * $job['command_index'] / max(1, count($commands)), "Running {$command}…");
+                        $result = $this->runArtisanCommands([$command]);
+                        $job['commands_output'] .= $result['output'];
+                        if (! $result['ok']) {
+                            UpdateProgress::fail('migrate', $result['message']);
+
+                            return [
+                                'ok' => false,
+                                'extracted' => true,
+                                'message' => 'Update files applied but a post-update command failed: ' . $result['message'],
+                                'backup_path' => $job['backup_id'] ?? null,
+                                'migration_output' => $job['migration_output'] ?? '',
+                                'commands_output' => $job['commands_output'],
+                            ];
+                        }
+                        $job['command_index']++;
+                        $ranOne = true;
+                    }
+
+                    $info = $job['info'];
+                    if (! empty($info['latest_version'])) {
+                        $this->updateEnvVersion((string) $info['latest_version']);
+                    }
+                    UpdateProgress::done('migrate', $job['migrate_summary'] ?? 'Done.');
+
+                    return [
+                        'ok' => true,
+                        'extracted' => true,
+                        'message' => 'Update v' . ($info['latest_version'] ?? '') . ' applied successfully.',
+                        'backup_path' => $job['backup_id'] ?? null,
+                        'version' => $info['latest_version'] ?? null,
+                        'removed' => $job['removed'] ?? [],
+                        'migration_output' => $job['migration_output'] ?? '',
+                        'commands_output' => $job['commands_output'],
+                    ];
+
+                default:
+                    return ['ok' => false, 'message' => 'Unknown update stage. Start the update again.'];
+            }
+
+            $worked = true;
+        }
+    }
+
+    /** Records the outcome of a finished job (history, activity log, event). */
+    private function finish(array $job, array $result): array
+    {
+        $fromVersion = (string) ($job['from_version'] ?? config('subandl.version', '1.0.0'));
+        $updateInfo = $job['info'] ?? [];
         $ok = (bool) ($result['ok'] ?? false);
+
+        // A verified package is kept for the retry (cleaned after a day); a
+        // partial download is not resumed by a new job, so it goes.
+        $download = $job['download'] ?? [];
+        if (! empty($download['part'])) {
+            @unlink($download['part']);
+            @unlink($download['part'] . '.chunk');
+        }
+        if (! empty($download['zip']) && ($ok || ! ($download['verified'] ?? false))) {
+            @unlink($download['zip']);
+        }
+
+        LicenseState::current()->forceFill(['update_running' => false])->save();
+
         $toVersion = $result['version'] ?? $updateInfo['latest_version'] ?? null;
+        $result['from_version'] = $fromVersion;
 
         $state = LicenseState::current();
         $state->last_update_status = $ok ? 'success' : 'failed';
@@ -133,176 +417,45 @@ class UpdateApplier
         return $result;
     }
 
-    private function applyUpdate(array $updateInfo): array
-    {
-        $downloadUrl = $updateInfo['download_url'] ?? null;
-
-        if (! $downloadUrl) {
-            UpdateProgress::fail('download', 'No download URL provided.');
-
-            return ['ok' => false, 'message' => 'No download URL provided by update server.'];
-        }
-
-        // Not forced — only actually backs up when one is due (or none ever ran);
-        // otherwise this is a no-op ('skipped' with ok: true).
-        $backupResult = $this->preUpdateBackup();
-        if (! ($backupResult['ok'] ?? false)) {
-            UpdateProgress::fail('backup', $backupResult['message'] ?? 'Backup failed.');
-
-            return ['ok' => false, 'message' => 'Aborting update: pre-update backup failed. ' . ($backupResult['message'] ?? '')];
-        }
-        $backupId = $backupResult['backup_id'] ?? null;
-        ($backupResult['skipped'] ?? false)
-            ? UpdateProgress::skip('backup', $backupResult['message'] ?? 'Not due.')
-            : UpdateProgress::done('backup', 'Backup uploaded.');
-
-        if (! class_exists(ZipArchive::class)) {
-            UpdateProgress::fail('download', 'The PHP zip extension is not enabled.');
-
-            return ['ok' => false, 'message' => 'The PHP zip extension is not enabled. Enable it in php.ini (extension=zip) and restart the web server.'];
-        }
-
-        $stagingDir = rtrim((string) config('subandl.update.staging_path', storage_path('app/update-staging')), '/\\');
-        if (! is_dir($stagingDir) && ! @mkdir($stagingDir, 0755, true) && ! is_dir($stagingDir)) {
-            UpdateProgress::fail('download', 'Could not create the staging folder.');
-
-            return ['ok' => false, 'message' => "Could not create the update staging folder '{$stagingDir}'."];
-        }
-
-        $download = $this->fetchPackage($updateInfo, $downloadUrl, $stagingDir);
-        if (! $download['ok']) {
-            UpdateProgress::fail('download', $download['message']);
-
-            return ['ok' => false, 'message' => $download['message']];
-        }
-        $zipPath = $download['path'];
-
-        // The package stays in staging until the files are merged, so a retry
-        // after e.g. a permission error does not download it again.
-        $keepPackage = false;
-
-        try {
-            $zip = new ZipArchive();
-            if ($zip->open($zipPath) !== true) {
-                UpdateProgress::fail('merge', 'Not a valid archive.');
-
-                return ['ok' => false, 'message' => 'Update package is not a valid archive.'];
-            }
-
-            if ($zip->numFiles === 0) {
-                $zip->close();
-                UpdateProgress::fail('merge', 'The package is empty.');
-
-                return ['ok' => false, 'message' => 'Update package is empty.', 'backup_path' => $backupId];
-            }
-
-            $extraction = $this->extractZipSafely($zip, base_path());
-            $zip->close();
-            $keepPackage = ! $extraction['ok'] && $download['verified'];
-        } finally {
-            if (! $keepPackage) {
-                @unlink($zipPath);
-            }
-        }
-
-        if (! $extraction['ok']) {
-            UpdateProgress::fail('merge', $extraction['message']);
-
-            return [
-                'ok' => false,
-                'extracted' => $extraction['extracted'] > 0,
-                'message' => 'Update package did not extract cleanly: ' . $extraction['message'],
-                'backup_path' => $backupId,
-            ];
-        }
-
-        $removed = $this->applyRemoveManifest();
-        UpdateProgress::done('merge', $this->mergeSummary($extraction) . ($removed ? ', ' . count($removed) . ' removed' : '') . '.');
-
-        $commands = array_merge(
-            is_array($updateInfo['commands'] ?? null) ? $updateInfo['commands'] : [],
-            (array) config('subandl.update.after_update_commands', []),
-        );
-
-        $migrationResult = $this->runMigrations(count($commands) > 0);
-        if (! $migrationResult['ok']) {
-            UpdateProgress::fail('migrate', $migrationResult['message']);
-
-            return [
-                'ok' => false,
-                'extracted' => true,
-                'message' => 'Update files applied but migrations failed: ' . $migrationResult['message'],
-                'backup_path' => $backupId,
-                'migration_output' => $migrationResult['output'],
-            ];
-        }
-
-        $commandsResult = $this->runArtisanCommands($commands, function (int $done, int $total, string $command) {
-            UpdateProgress::stage('migrate', 85 + 15 * $done / max(1, $total), "Running {$command}…");
-        });
-        if (! $commandsResult['ok']) {
-            UpdateProgress::fail('migrate', $commandsResult['message']);
-
-            return [
-                'ok' => false,
-                'extracted' => true,
-                'message' => 'Update files applied but a post-update command failed: ' . $commandsResult['message'],
-                'backup_path' => $backupId,
-                'migration_output' => $migrationResult['output'],
-                'commands_output' => $commandsResult['output'],
-            ];
-        }
-
-        if (! empty($updateInfo['latest_version'])) {
-            $this->updateEnvVersion((string) $updateInfo['latest_version']);
-        }
-
-        UpdateProgress::done('migrate', $migrationResult['summary']);
-
-        return [
-            'ok' => true,
-            'extracted' => true,
-            'message' => 'Update v' . ($updateInfo['latest_version'] ?? '') . ' applied successfully.',
-            'backup_path' => $backupId,
-            'version' => $updateInfo['latest_version'] ?? null,
-            'removed' => $removed,
-            'migration_output' => $migrationResult['output'],
-            'commands_output' => $commandsResult['output'],
-        ];
-    }
-
     /**
      * The backup before an update. A backup already running in another process
-     * (the scheduler, the browser's auto-check, the button) used to reject the
-     * update outright; now the update waits for it (up to backup_wait_minutes,
-     * default 10) — and when that backup succeeded it is the pre-update backup,
-     * since the schedule then reports the next one as not due.
+     * (the scheduler, the browser's auto-check, the button) is waited for (up
+     * to backup_wait_minutes, default 10) — and when that backup succeeded it
+     * is the pre-update backup, since the schedule then reports the next one
+     * as not due. In chunked mode the wait is spread over several requests.
+     *
+     * @return array|null null while still waiting for the other backup
      */
-    private function preUpdateBackup(): array
+    private function preUpdateBackup(array &$job, float $deadline): ?array
     {
         $waitSeconds = 60 * (int) config('subandl.update.backup_wait_minutes', 10);
-        $waited = false;
 
-        for ($attempt = 1; ; $attempt++) {
+        while (true) {
             if ($this->backupService->isRunning()) {
-                $waited = true;
-                $idle = $this->backupService->waitUntilIdle($waitSeconds, fn (int $waited) => UpdateProgress::stage(
-                    'backup',
-                    0,
-                    'Waiting for the backup already running to finish… (' . gmdate($waited >= 3600 ? 'G:i:s' : 'i:s', $waited) . ')'
-                ));
+                $job['backup_waited'] = true;
+                $since = $job['backup_wait_since'] ??= time();
+                $left = $waitSeconds - (time() - $since);
+                $slice = $deadline === INF ? $left : (int) min($left, max(1, ceil($deadline - microtime(true))));
+
+                $idle = $left > 0 && $this->backupService->waitUntilIdle($slice, function () use ($since) {
+                    $waited = time() - $since;
+                    UpdateProgress::stage('backup', 0, 'Waiting for the backup already running to finish… (' . gmdate($waited >= 3600 ? 'G:i:s' : 'i:s', $waited) . ')');
+                });
 
                 if (! $idle) {
-                    return ['ok' => false, 'message' => 'A backup is still running. Try the update again once it has finished.'];
+                    return $left <= $slice
+                        ? ['ok' => false, 'message' => 'A backup is still running. Try the update again once it has finished.']
+                        : null;
                 }
             }
 
             UpdateProgress::stage('backup', 0, 'Checking whether a backup is due…');
             $result = $this->backupService->runBackup(beforeUpdate: true);
+            $job['backup_attempts'] = ($job['backup_attempts'] ?? 0) + 1;
 
             // Another process claimed the backup between the check and the claim: wait for that one.
-            if (! ($result['running'] ?? false) || $attempt >= 3) {
-                return $waited && ($result['skipped'] ?? false) && ($result['ok'] ?? false)
+            if (! ($result['running'] ?? false) || $job['backup_attempts'] >= 3) {
+                return ($job['backup_waited'] ?? false) && ($result['skipped'] ?? false) && ($result['ok'] ?? false)
                     ? ['message' => 'Used the backup that just finished.'] + $result
                     : $result;
             }
@@ -312,96 +465,284 @@ class UpdateApplier
     /**
      * Gets the package into staging: reuses one an earlier attempt already
      * downloaded when its checksum still matches, otherwise streams it to disk
-     * (reporting the download percentage), retrying a connection error or 5xx.
+     * — in one request on the CLI, or in Range-request slices of
+     * download_chunk_bytes appended to a .part file in chunked mode (a server
+     * that ignores Range just sends the whole file in the first slice).
      *
-     * @return array{ok: bool, message?: string, path?: string, verified?: bool}
+     * @return array{ok: bool, message?: string}|null null when more is left for the next chunk
      */
-    private function fetchPackage(array $updateInfo, string $downloadUrl, string $stagingDir): array
+    private function fetchPackage(array &$job, float $deadline): ?array
     {
-        $expected = is_string($updateInfo['checksum'] ?? null) && $updateInfo['checksum'] !== ''
-            ? strtolower($updateInfo['checksum'])
-            : null;
-        $version = preg_replace('/[^0-9A-Za-z._-]/', '', (string) ($updateInfo['latest_version'] ?? '')) ?: 'unknown';
+        if (! isset($job['download'])) {
+            $info = $job['info'];
+            $expected = is_string($info['checksum'] ?? null) && $info['checksum'] !== ''
+                ? strtolower($info['checksum'])
+                : null;
+            $version = preg_replace('/[^0-9A-Za-z._-]/', '', (string) ($info['latest_version'] ?? '')) ?: 'unknown';
+            $stagingDir = $this->stagingDir();
 
-        $this->cleanupStaging($stagingDir);
+            $this->cleanupStaging($stagingDir);
 
-        // Only a package with a known checksum can be trusted on a second run.
-        $zipPath = $stagingDir . DIRECTORY_SEPARATOR . ($expected
-            ? "update-{$version}-" . substr($expected, 0, 16) . '.zip'
-            : "update-{$version}-" . now()->format('YmdHis') . '.zip');
+            // Only a package with a known checksum can be trusted on a second run.
+            $zipPath = $stagingDir . DIRECTORY_SEPARATOR . ($expected
+                ? "update-{$version}-" . substr($expected, 0, 16) . '.zip'
+                : "update-{$version}-" . now()->format('YmdHis') . '.zip');
 
-        if ($expected && is_file($zipPath)) {
-            UpdateProgress::stage('download', 50, 'Verifying the package downloaded earlier…');
-            if (hash_equals($expected, hash_file('sha256', $zipPath))) {
-                UpdateProgress::done('download', 'Reused the package downloaded earlier (' . self::bytes(filesize($zipPath)) . ').');
+            if ($expected && is_file($zipPath)) {
+                UpdateProgress::stage('download', 50, 'Verifying the package downloaded earlier…');
+                if (hash_equals($expected, hash_file('sha256', $zipPath))) {
+                    $job['download'] = ['zip' => $zipPath, 'verified' => true];
+                    UpdateProgress::done('download', 'Reused the package downloaded earlier (' . self::bytes(filesize($zipPath)) . ').');
 
-                return ['ok' => true, 'path' => $zipPath, 'verified' => true];
+                    return ['ok' => true];
+                }
+                @unlink($zipPath);
             }
-            @unlink($zipPath);
+
+            $job['download'] = [
+                'url' => (string) $info['download_url'],
+                'zip' => $zipPath,
+                'part' => $zipPath . '.part',
+                'expected' => $expected,
+                'offset' => 0,
+                'total' => (int) ($info['size'] ?? $info['file_size'] ?? 0),
+                'verified' => false,
+            ];
+            @unlink($job['download']['part']);
+            UpdateProgress::stage('download', 0, 'Connecting…');
         }
 
-        $partPath = $zipPath . '.part';
-        $knownSize = (int) ($updateInfo['size'] ?? $updateInfo['file_size'] ?? 0);
-        $progress = function ($total, $received) use ($knownSize) {
-            $total = $total ?: $knownSize;
+        $d = &$job['download'];
+        if (! isset($d['part'])) {
+            return ['ok' => true]; // reused package
+        }
+
+        try {
+            $received = $deadline === INF ? $this->downloadWhole($d) : $this->downloadSlices($d, $deadline);
+        } catch (\Illuminate\Http\Client\ConnectionException $e) {
+            return ['ok' => false, 'message' => 'Update package download failed: ' . $e->getMessage()];
+        }
+
+        if ($received !== true) {
+            return $received; // null (more to come) or the failure
+        }
+
+        UpdateProgress::stage('download', 97, 'Verifying checksum…');
+        if ($d['expected'] && ! hash_equals($d['expected'], hash_file('sha256', $d['part']))) {
+            return ['ok' => false, 'message' => 'Update package checksum mismatch — download is corrupt or was tampered with.'];
+        }
+
+        if (! @rename($d['part'], $d['zip'])) {
+            return ['ok' => false, 'message' => "Could not move the downloaded package into '{$this->stagingDir()}'."];
+        }
+
+        $d['verified'] = $d['expected'] !== null;
+        unset($d['part']);
+        UpdateProgress::done('download', 'Downloaded ' . self::bytes(filesize($d['zip'])) . '.');
+
+        return ['ok' => true];
+    }
+
+    /** @return true|array true when the whole package is in the .part file, else the failure */
+    private function downloadWhole(array &$d): bool|array
+    {
+        $response = $this->getPackage($d['url'], $d['part'], function ($total, $received) use ($d) {
+            $total = $total ?: $d['total'];
             UpdateProgress::stage(
                 'download',
                 $total > 0 ? 95 * $received / $total : 0,
                 $total > 0 ? self::bytes($received) . ' of ' . self::bytes($total) : self::bytes($received) . ' received'
             );
-        };
+        });
 
-        try {
-            UpdateProgress::stage('download', 0, 'Connecting…');
-
-            // Streamed to disk rather than held in memory. Tried at least twice
-            // on a connection error or 5xx before the update gives up.
-            $attempts = max(2, (int) config('subandl.live_attempts', 2));
-            for ($attempt = 1; ; $attempt++) {
-                try {
-                    $response = HttpClient::request()->timeout((int) config('subandl.update.download_timeout', 300))
-                        ->withOptions(['progress' => $progress])
-                        ->sink($partPath)
-                        ->get($downloadUrl);
-
-                    if (! $response->serverError() || $attempt >= $attempts) {
-                        break;
-                    }
-                    $reason = 'HTTP ' . $response->status();
-                } catch (\Illuminate\Http\Client\ConnectionException $e) {
-                    if ($attempt >= $attempts) {
-                        ActivityLog::record('update', false, "Package download failed after {$attempt} attempts: {$e->getMessage()}");
-                        throw $e;
-                    }
-                    $reason = $e->getMessage();
-                }
-
-                ActivityLog::record('update', false, "Package download attempt {$attempt} failed ({$reason}); retrying.");
-                UpdateProgress::stage('download', 0, "Attempt {$attempt} failed ({$reason}); retrying…");
-                sleep((int) config('subandl.live_retry_delay_seconds', 2));
-            }
-
-            if (! $response->successful()) {
-                return ['ok' => false, 'message' => 'Update package download failed (HTTP ' . $response->status() . ').'];
-            }
-
-            UpdateProgress::stage('download', 97, 'Verifying checksum…');
-            if ($expected && ! hash_equals($expected, hash_file('sha256', $partPath))) {
-                return ['ok' => false, 'message' => 'Update package checksum mismatch — download is corrupt or was tampered with.'];
-            }
-
-            if (! @rename($partPath, $zipPath)) {
-                return ['ok' => false, 'message' => "Could not move the downloaded package into '{$stagingDir}'."];
-            }
-        } catch (\Illuminate\Http\Client\ConnectionException $e) {
-            return ['ok' => false, 'message' => 'Update package download failed: ' . $e->getMessage()];
-        } finally {
-            @unlink($partPath);
+        if (! $response->successful()) {
+            return ['ok' => false, 'message' => 'Update package download failed (HTTP ' . $response->status() . ').'];
         }
 
-        UpdateProgress::done('download', 'Downloaded ' . self::bytes(filesize($zipPath)) . '.');
+        return true;
+    }
 
-        return ['ok' => true, 'path' => $zipPath, 'verified' => $expected !== null];
+    /** @return true|array|null true when complete, null when the budget ran out first, else the failure */
+    private function downloadSlices(array &$d, float $deadline): bool|array|null
+    {
+        $sliceBytes = max(256 * 1024, (int) config('subandl.update.download_chunk_bytes', 8 * 1024 * 1024));
+        $slicePath = $d['part'] . '.chunk';
+
+        while (true) {
+            $from = (int) $d['offset'];
+            $response = $this->getPackage($d['url'], $slicePath, function ($total, $received) use ($d, $from) {
+                $all = (int) $d['total'];
+                $got = $from + $received;
+                UpdateProgress::stage(
+                    'download',
+                    $all > 0 ? 95 * $got / $all : 0,
+                    $all > 0 ? self::bytes($got) . ' of ' . self::bytes($all) : self::bytes($got) . ' received'
+                );
+            }, ['Range' => 'bytes=' . $from . '-' . ($from + $sliceBytes - 1)]);
+
+            $status = $response->status();
+            clearstatcache();
+            $size = (int) @filesize($slicePath);
+
+            if ($status === 206) {
+                if (! preg_match('#bytes\s+(\d+)-(\d+)/(\d+|\*)#i', (string) $response->header('Content-Range'), $m) || (int) $m[1] !== $from) {
+                    @unlink($slicePath);
+
+                    return ['ok' => false, 'message' => 'Update package download failed (the server sent an unexpected byte range).'];
+                }
+
+                if (! $this->appendFile($slicePath, $d['part'])) {
+                    return ['ok' => false, 'message' => "Could not write the download into '{$this->stagingDir()}'."];
+                }
+                $d['offset'] = $from + $size;
+                if ($m[3] !== '*') {
+                    $d['total'] = (int) $m[3];
+                }
+                $complete = $d['total'] > 0 ? $d['offset'] >= $d['total'] : $size < $sliceBytes;
+            } elseif ($status === 200) {
+                // Range not supported: this one response is the whole package.
+                @unlink($d['part']);
+                if (! @rename($slicePath, $d['part'])) {
+                    return ['ok' => false, 'message' => "Could not write the download into '{$this->stagingDir()}'."];
+                }
+                $d['offset'] = $d['total'] = $size;
+                $complete = true;
+            } elseif ($status === 416 && $from > 0) {
+                // Asked past the end: everything is already here.
+                @unlink($slicePath);
+                $complete = true;
+            } else {
+                @unlink($slicePath);
+
+                return ['ok' => false, 'message' => 'Update package download failed (HTTP ' . $status . ').'];
+            }
+
+            if ($complete) {
+                return true;
+            }
+            if (microtime(true) >= $deadline) {
+                return null;
+            }
+        }
+    }
+
+    /**
+     * One GET streamed to $sink, tried at least twice on a connection error
+     * or 5xx before giving up.
+     *
+     * @throws \Illuminate\Http\Client\ConnectionException
+     */
+    private function getPackage(string $url, string $sink, callable $progress, array $headers = []): \Illuminate\Http\Client\Response
+    {
+        $attempts = max(2, (int) config('subandl.live_attempts', 2));
+
+        for ($attempt = 1; ; $attempt++) {
+            try {
+                $response = HttpClient::request()->timeout((int) config('subandl.update.download_timeout', 300))
+                    ->withHeaders($headers)
+                    ->withOptions(['progress' => $progress])
+                    ->sink($sink)
+                    ->get($url);
+
+                if (! $response->serverError() || $attempt >= $attempts) {
+                    return $response;
+                }
+                $reason = 'HTTP ' . $response->status();
+            } catch (\Illuminate\Http\Client\ConnectionException $e) {
+                if ($attempt >= $attempts) {
+                    ActivityLog::record('update', false, "Package download failed after {$attempt} attempts: {$e->getMessage()}");
+                    throw $e;
+                }
+                $reason = $e->getMessage();
+            }
+
+            ActivityLog::record('update', false, "Package download attempt {$attempt} failed ({$reason}); retrying.");
+            UpdateProgress::stage('download', 0, "Attempt {$attempt} failed ({$reason}); retrying…");
+            sleep((int) config('subandl.live_retry_delay_seconds', 2));
+        }
+    }
+
+    private function appendFile(string $from, string $to): bool
+    {
+        $in = @fopen($from, 'rb');
+        $out = @fopen($to, 'ab');
+        $ok = $in !== false && $out !== false && stream_copy_to_stream($in, $out) !== false;
+        $in && fclose($in);
+        $out && fclose($out);
+        @unlink($from);
+
+        return $ok;
+    }
+
+    /**
+     * Opens the package and merges as much of it as the budget allows,
+     * continuing from the cursor the last chunk saved in the job.
+     *
+     * @return array|null null when more is left for the next chunk
+     */
+    private function mergePackage(array &$job, float $deadline): ?array
+    {
+        $zipPath = $job['download']['zip'];
+        $zip = new ZipArchive();
+        if ($zip->open($zipPath) !== true) {
+            return ['ok' => false, 'message' => 'Update package is not a valid archive.'];
+        }
+
+        try {
+            if ($zip->numFiles === 0) {
+                return ['ok' => false, 'message' => 'Update package is empty.'];
+            }
+
+            $cursor = $job['merge'] ?? [];
+            $result = $this->extractZipSafely($zip, base_path(), $cursor, $deadline);
+            $job['merge'] = $cursor;
+        } finally {
+            // Closed every chunk: Windows keeps an open file locked.
+            $zip->close();
+        }
+
+        if ($result !== null && $result['ok']) {
+            @unlink($zipPath);
+        }
+
+        return $result;
+    }
+
+    private function stagingDir(): string
+    {
+        return rtrim((string) config('subandl.update.staging_path', storage_path('app/update-staging')), '/\\');
+    }
+
+    private function jobPath(): string
+    {
+        return $this->stagingDir() . DIRECTORY_SEPARATOR . 'job.json';
+    }
+
+    private function loadJob(): ?array
+    {
+        $data = json_decode((string) @file_get_contents($this->jobPath()), true);
+
+        return is_array($data) && ($data['format'] ?? null) === 1 && isset($data['run'], $data['phase']) ? $data : null;
+    }
+
+    private function saveJob(array $job): void
+    {
+        $path = $this->jobPath();
+        if (! is_dir(dirname($path))) {
+            @mkdir(dirname($path), 0755, true);
+        }
+
+        // Temp file + rename, so a crash mid-write never leaves half a job.
+        $temp = $path . '.' . getmypid() . '.tmp';
+        if (@file_put_contents($temp, json_encode($job)) === false || ! @rename($temp, $path)) {
+            @unlink($temp);
+            @file_put_contents($path, json_encode($job));
+        }
+    }
+
+    private function clearJob(): void
+    {
+        @unlink($this->jobPath());
     }
 
     /** Drops packages and partial downloads older than a day (an abandoned version). */
@@ -467,46 +808,75 @@ class UpdateApplier
      *  2. Write (15–100%, by bytes): only the changed entries, with the fewest
      *     file operations each (see extractEntry()).
      *
-     * @return array{ok: bool, message?: string, extracted: int, written: int, unchanged: int}
+     * Both passes stop at $deadline and keep their place in $cursor, so the
+     * next chunk carries on where this one stopped. Redoing part of a chunk
+     * (a request killed mid-way) is harmless: a written file compares equal.
+     *
+     * @param array $cursor  compared, changed (zip indexes), changed_bytes, unchanged, written, done_bytes
+     * @return array{ok: bool, message?: string, extracted: int, written: int, unchanged: int}|null
      */
-    private function extractZipSafely(ZipArchive $zip, string $destination): array
+    private function extractZipSafely(ZipArchive $zip, string $destination, array &$cursor, float $deadline): ?array
     {
         $destination = rtrim($destination, '/\\');
         $manifest = $this->loadManifest($destination);
         $seen = [];
-        $unchanged = 0;
-
-        $entries = [];
-        for ($i = 0; $i < $zip->numFiles; $i++) {
-            $stat = $zip->statIndex($i);
-            $relative = $stat === false ? null : $this->safeRelativePath($stat['name']);
-            if ($relative !== null) {
-                $entries[] = [$i, $stat, $relative];
-            }
-        }
+        $cursor += ['compared' => 0, 'compare_done' => false, 'changed' => [], 'changed_bytes' => 0, 'unchanged' => 0, 'written' => 0, 'done_bytes' => 0];
 
         // Pass 1: find what actually changed.
-        $count = count($entries);
-        $changed = [];
-        $changedBytes = 0;
-        UpdateProgress::stage('merge', 0, "Comparing 0 of {$count} files…");
-        foreach ($entries as $n => $entry) {
-            [, $stat, $relative] = $entry;
-            if ($this->isUnchanged($stat, $destination . '/' . $relative, $manifest[$relative] ?? null)) {
-                $unchanged++;
-                $seen[$relative] = $stat;
-            } else {
-                $changed[] = $entry;
-                $changedBytes += (int) $stat['size'];
+        if (! $cursor['compare_done']) {
+            $entries = [];
+            for ($i = 0; $i < $zip->numFiles; $i++) {
+                $stat = $zip->statIndex($i);
+                $relative = $stat === false ? null : $this->safeRelativePath($stat['name']);
+                if ($relative !== null) {
+                    $entries[] = [$i, $stat, $relative];
+                }
             }
-            UpdateProgress::stage('merge', 15 * ($n + 1) / max(1, $count), 'Comparing ' . ($n + 1) . " of {$count} files · " . count($changed) . ' changed');
+
+            $count = count($entries);
+            UpdateProgress::stage('merge', 15 * $cursor['compared'] / max(1, $count), "Comparing {$cursor['compared']} of {$count} files…");
+            for ($n = $cursor['compared']; $n < $count; $n++) {
+                if (microtime(true) >= $deadline && $n > $cursor['compared']) {
+                    $cursor['compared'] = $n;
+                    $this->saveManifest($destination, $manifest, $seen);
+
+                    return null;
+                }
+
+                [$i, $stat, $relative] = $entries[$n];
+                if ($this->isUnchanged($stat, $destination . '/' . $relative, $manifest[$relative] ?? null)) {
+                    $cursor['unchanged']++;
+                    $seen[$relative] = $stat;
+                } else {
+                    $cursor['changed'][] = $i;
+                    $cursor['changed_bytes'] += (int) $stat['size'];
+                }
+                UpdateProgress::stage('merge', 15 * ($n + 1) / max(1, $count), 'Comparing ' . ($n + 1) . " of {$count} files · " . count($cursor['changed']) . ' changed');
+            }
+
+            $cursor['compared'] = $count;
+            $cursor['compare_done'] = true;
         }
 
         // Pass 2: write only the changed entries.
-        $total = count($changed);
-        $written = 0;
-        $doneBytes = 0;
-        foreach ($changed as [$i, $stat, $relative]) {
+        $total = count($cursor['changed']);
+        $startedAt = $cursor['written'];
+        while ($cursor['written'] < $total) {
+            if (microtime(true) >= $deadline && $cursor['written'] > $startedAt) {
+                $this->saveManifest($destination, $manifest, $seen);
+
+                return null;
+            }
+
+            $i = $cursor['changed'][$cursor['written']];
+            $stat = $zip->statIndex($i);
+            $relative = $stat === false ? null : $this->safeRelativePath($stat['name']);
+            if ($relative === null) {
+                $this->saveManifest($destination, $manifest, $seen);
+
+                return ['ok' => false, 'message' => 'the package changed while it was being merged', 'extracted' => $cursor['written'], 'written' => $cursor['written'], 'unchanged' => $cursor['unchanged']];
+            }
+
             // Laravel turns warnings into ErrorException; both that and a
             // plain failure end the extraction with the entry named.
             try {
@@ -521,25 +891,25 @@ class UpdateApplier
                 return [
                     'ok' => false,
                     'message' => "failed to extract '{$stat['name']}' ({$error})",
-                    'extracted' => $written,
-                    'written' => $written,
-                    'unchanged' => $unchanged,
+                    'extracted' => $cursor['written'],
+                    'written' => $cursor['written'],
+                    'unchanged' => $cursor['unchanged'],
                 ];
             }
 
             $seen[$relative] = $stat;
-            $written++;
-            $doneBytes += (int) $stat['size'];
+            $cursor['written']++;
+            $cursor['done_bytes'] += (int) $stat['size'];
             UpdateProgress::stage(
                 'merge',
-                15 + 85 * ($changedBytes > 0 ? $doneBytes / $changedBytes : $written / max(1, $total)),
-                "Writing {$written} of {$total} changed files · {$unchanged} unchanged"
+                15 + 85 * ($cursor['changed_bytes'] > 0 ? $cursor['done_bytes'] / $cursor['changed_bytes'] : $cursor['written'] / max(1, $total)),
+                "Writing {$cursor['written']} of {$total} changed files · {$cursor['unchanged']} unchanged"
             );
         }
 
         $this->saveManifest($destination, $manifest, $seen);
 
-        return ['ok' => true, 'extracted' => $written + $unchanged, 'written' => $written, 'unchanged' => $unchanged];
+        return ['ok' => true, 'extracted' => $cursor['written'] + $cursor['unchanged'], 'written' => $cursor['written'], 'unchanged' => $cursor['unchanged']];
     }
 
     /**

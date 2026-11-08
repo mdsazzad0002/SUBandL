@@ -117,7 +117,8 @@ export function createSubandl({ base = '' } = {}) {
 
     /**
      * Reads the live stage progress every 700ms while an update request is
-     * open; returns stop(). Laravel sessions don't lock, so this runs beside it.
+     * open; returns stop(). Laravel sessions don't lock, so this runs beside it
+     * (on a single-threaded server it is answered between chunks instead).
      */
     function watchProgress(run, onTick) {
         let stopped = false;
@@ -179,9 +180,33 @@ export function createSubandl({ base = '' } = {}) {
                 // Tags this step's snapshot, so a poll never shows the last step's.
                 const run = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
                 const stop = watchProgress(run, tick);
-                const r = await request('POST', '/license/update/run', { run });
+
+                // The server works in short chunks (continue: true) so no request
+                // hits a web server timeout; keep calling until the step is done.
+                // A chunk whose request died is simply sent again — every stage
+                // carries on from where it stopped.
+                let r;
+                let retries = 0;
+                for (;;) {
+                    r = await request('POST', '/license/update/run', { run });
+                    if (r.data && r.data.progress && r.data.progress.run === run) tick(r.data.progress);
+                    if (r.ok && r.data.continue) {
+                        retries = 0;
+                        if (r.status === 202) await sleep(2000); // the previous chunk is still finishing
+                        continue;
+                    }
+                    const definite = r.status === 503 && r.data.retry_at !== undefined;
+                    if ((r.status === 0 || r.status >= 500) && !definite && retries < 5) {
+                        retries++;
+                        onProgress({ message: `Connection lost, retrying (${retries}/5)…`, step: step + 1, progress: null });
+                        await sleep(3000);
+                        continue;
+                    }
+                    break;
+                }
+
                 stop();
-                const progress = await latestProgress(run);
+                const progress = (r.data && r.data.progress && r.data.progress.run === run && r.data.progress) || (await latestProgress(run));
 
                 if (r.status === 409) {
                     return { ok: false, message: r.data.message || 'An update is already running.' };
