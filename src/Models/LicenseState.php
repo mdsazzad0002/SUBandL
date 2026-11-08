@@ -60,7 +60,10 @@ class LicenseState extends Model
         'update_started_at' => 'datetime',
     ];
 
-    private const CACHE_KEY = 'subandl:license-state';
+    // ":attrs": an array of attributes since v2.4 (a model before). A key of its
+    // own, so older code running against the same cache (a rollback, a release
+    // shipping an older vendor/) never reads this format, and the other way round.
+    private const CACHE_KEY = 'subandl:license-state:attrs';
     private const CACHE_MINUTES = 5;
 
     public function getTable()

@@ -27,9 +27,11 @@ class ServerHealth
     public const CACHE_MINUTES = 30;
 
     private const STATUS_KEY = 'subandl:server-health:status';
-    private const CHECKED_AT_KEY = 'subandl:server-health:checked-at';
+    // ":ts" keys hold timestamps (Carbon objects before v2.4): their own keys, so
+    // older code sharing the cache never gets an int where it expects Carbon.
+    private const CHECKED_AT_KEY = 'subandl:server-health:checked-at:ts';
     private const CLAIM_KEY = 'subandl:server-health:claim';
-    private const BACKOFF_KEY = 'subandl:server-health:backoff-until';
+    private const BACKOFF_KEY = 'subandl:server-health:backoff-until:ts';
 
     /**
      * Fails OPEN (true) when nothing has been reported recently, so scheduled tasks
