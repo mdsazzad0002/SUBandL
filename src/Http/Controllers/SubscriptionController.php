@@ -474,6 +474,8 @@ class SubscriptionController extends Controller
             // Short-lived: download URLs may be signed.
             unset($next['raw']);
             Cache::put(self::NEXT_UPDATE_KEY, ['from' => (string) $stepToVersion, 'result' => $next], now()->addMinutes(2));
+            // The next step's package starts downloading while this response goes back.
+            app(UpdateApplier::class)->schedulePrefetch($next);
         }
 
         return response()->json([

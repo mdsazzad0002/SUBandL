@@ -648,6 +648,23 @@ function patchStages() {
 
 let modalShape = null; // what the update card was last built for, minus the numbers
 
+// The package is fetched in the background as soon as a new version is found,
+// so the click only has to confirm and install it.
+function packageHtml(pkg) {
+    const mb = (n) => (n / 1048576).toFixed(1) + ' MB';
+    if (pkg.state === 'ready') {
+        return `<p class="sbw-flash sbw-ok" role="status">${icons.check} Downloaded${pkg.total ? ` (${mb(pkg.total)})` : ''} and backed up in the background — installs in moments.</p>`;
+    }
+    if (pkg.state === 'backing-up') {
+        return `<p class="sbw-flash sbw-info" role="status">Package downloaded; taking the backup in the background… You can install now; it waits for the backup.</p>`;
+    }
+    if (pkg.state === 'downloading') {
+        const pct = pkg.total ? Math.floor((100 * pkg.received) / pkg.total) : null;
+        return `<p class="sbw-flash sbw-info" role="status">Downloading in the background…${pct !== null ? ` ${pct}% of ${mb(pkg.total)}` : ''} You can install now; it continues from there.</p>`;
+    }
+    return '';
+}
+
 function renderModal(u, progress = null, error = null) {
     const news = changelogHtml(u);
 
@@ -678,7 +695,8 @@ function renderModal(u, progress = null, error = null) {
     const ready = !busy && updateStep === null;
 
     // Same card, new numbers: patch in place instead of rebuilding.
-    const shape = JSON.stringify([u.latest_version, state.version, updateStep, busy, progress, error, ready]);
+    const pkg = u.package || {};
+    const shape = JSON.stringify([u.latest_version, state.version, updateStep, busy, progress, error, ready, pkg.state, ready && pkg.state === 'downloading' ? pkg.received : 0]);
     if (shape === modalShape && modalCard.querySelector('.sbw-stages')) {
         patchStages();
         return;
@@ -696,16 +714,17 @@ function renderModal(u, progress = null, error = null) {
         </div>
         <div class="sbw-modal-body">
             ${ready && news ? `<div class="sbw-box"><span class="sbw-label">What's new</span>${news}</div>` : ''}
+            ${ready ? packageHtml(pkg) : ''}
             ${ready ? `<ul class="sbw-assure">
-                <li>${icons.check} A full backup is taken first</li>
+                <li>${icons.check} ${pkg.state === 'ready' ? 'Backup already taken' : 'A full backup is taken first'}</li>
                 <li>${icons.check} Your data and settings stay as they are</li>
-                <li>${icons.check} Usually done in about a minute</li>
+                <li>${icons.check} ${pkg.state === 'ready' ? 'Already downloaded — usually done in seconds' : 'Usually done in about a minute'}</li>
             </ul>` : stagesHtml()}
             ${progress ? `<p class="sbw-flash sbw-info" role="status">${esc(progress)}</p>` : ''}
             ${error ? `<p class="sbw-flash sbw-bad" role="alert">${esc(error)}</p>` : ''}
             <div class="sbw-actions">
                 ${u.force_update || busy ? '' : `<button type="button" class="sbw-btn sbw-ghost" data-sbw="update-later">${error ? 'Close' : 'Later'}</button>`}
-                ${updateStep === 'done' ? '' : `<button type="button" class="sbw-btn sbw-btn-lg" data-sbw="update-run" ${actionOff()}>${busy === 'update' ? 'Updating…' : error ? 'Try again' : 'Update now'}</button>`}
+                ${updateStep === 'done' ? '' : `<button type="button" class="sbw-btn sbw-btn-lg" data-sbw="update-run" ${actionOff()}>${busy === 'update' ? 'Updating…' : error ? 'Try again' : pkg.state === 'ready' ? 'Install now' : 'Update now'}</button>`}
             </div>
         </div>`;
 }
@@ -827,7 +846,12 @@ function autoPrompt() {
     }
 
     const u = state.update;
-    if (u?.available && !u.running && !unlicensed() && modal.hidden && payModal.hidden
+    // Asked only once the package is downloaded and the backup taken in the
+    // background, so "Install now" is quick; the Update button works anytime.
+    const preparing = ['downloading', 'backing-up'].includes(u?.package?.state);
+    // Look again every minute (instead of every 5) until it is ready to ask.
+    if (preparing && document.visibilityState === 'visible') refresh(true);
+    if (u?.available && !u.running && !preparing && !unlicensed() && modal.hidden && payModal.hidden
         && modalDismissedFor !== u.latest_version
         && (u.force_update || !snoozed(UPDATE_SNOOZE_KEY + u.latest_version))) {
         showModal();

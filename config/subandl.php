@@ -306,6 +306,10 @@ return [
         // can still answer the progress bar. The CLI/scheduler runs in one go.
         'chunk_seconds' => (int) env('SUBANDL_UPDATE_CHUNK_SECONDS', 10),
 
+        // Download a new version's package in the background as soon as an
+        // update check finds it, so "Update now" only installs it.
+        'prefetch' => (bool) env('SUBANDL_UPDATE_PREFETCH', true),
+
         // A backup already running when an update starts (scheduler, the
         // "Backup now" button) is waited for this long instead of rejecting
         // the update; when it succeeds it counts as the pre-update backup.

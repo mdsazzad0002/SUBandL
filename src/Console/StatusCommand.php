@@ -42,6 +42,7 @@ class StatusCommand extends Command
             ['Last error', $state->last_verification_error ?? '-'],
             ['Last update check', optional($state->last_update_check_at)->toDateTimeString() ?? 'never'],
             ['Last update', trim(($state->last_update_status ?? '-') . ' ' . ($state->last_update_message ?? ''))],
+            ['Next version package', $this->package()],
             ['Backup enabled', $state->backup_enabled ? 'yes' : 'no'],
             ['Last backup', trim((optional($state->last_backup_at)->toDateTimeString() ?? 'never') . ' ' . ($state->last_backup_status ?? ''))],
         ]);
@@ -80,5 +81,23 @@ class StatusCommand extends Command
             ['zip extension (updates)', $yes(class_exists(\ZipArchive::class))],
             ['Storage writable', $yes(is_writable(storage_path('app')))],
         ];
+    }
+
+    /** The background download of the next version's package. */
+    private function package(): string
+    {
+        $notice = \SUBandL\Support\UpdateNotice::get();
+        if (! $notice['available']) {
+            return '-';
+        }
+
+        $p = app(\SUBandL\Update\UpdateApplier::class)->packageStatus($notice['latest_version']);
+
+        return 'v' . $notice['latest_version'] . ': ' . match ($p['state']) {
+            'ready' => 'downloaded, ready to install (' . number_format($p['total'] / 1048576, 1) . ' MB)',
+            'downloading' => 'downloading in the background' . ($p['total'] ? ' (' . (int) (100 * $p['received'] / $p['total']) . '%)' : ''),
+            'failed' => 'background download failed: ' . ($p['message'] ?? '?'),
+            default => 'not downloaded yet',
+        };
     }
 }

@@ -49,12 +49,24 @@ class ServerHealth
     public function record(bool $healthy): void
     {
         Cache::put(self::STATUS_KEY, $healthy, now()->addMinutes(self::CACHE_MINUTES));
-        Cache::put(self::CHECKED_AT_KEY, now(), now()->addMinutes(self::CACHE_MINUTES));
+        // Timestamps, not Carbon objects: Laravel 13 does not unserialize objects
+        // from the cache (cache.serializable_classes = false).
+        Cache::put(self::CHECKED_AT_KEY, now()->getTimestamp(), now()->addMinutes(self::CACHE_MINUTES));
     }
 
     public function lastCheckedAt(): ?Carbon
     {
-        return Cache::get(self::CHECKED_AT_KEY);
+        return self::toCarbon(Cache::get(self::CHECKED_AT_KEY));
+    }
+
+    /** A cached timestamp (or a Carbon cached by an older version) as Carbon. */
+    private static function toCarbon(mixed $value): ?Carbon
+    {
+        return match (true) {
+            $value instanceof Carbon => $value,
+            is_int($value) => Carbon::createFromTimestamp($value),
+            default => null,
+        };
     }
 
     /**
@@ -82,7 +94,7 @@ class ServerHealth
     public function backOff(): Carbon
     {
         $until = now()->addMinutes(self::retryMinutes());
-        Cache::put(self::BACKOFF_KEY, $until, $until);
+        Cache::put(self::BACKOFF_KEY, $until->getTimestamp(), $until);
         $this->record(false);
 
         return $until;
@@ -90,9 +102,9 @@ class ServerHealth
 
     public function backoffUntil(): ?Carbon
     {
-        $until = Cache::get(self::BACKOFF_KEY);
+        $until = self::toCarbon(Cache::get(self::BACKOFF_KEY));
 
-        return $until instanceof Carbon && $until->isFuture() ? $until : null;
+        return $until && $until->isFuture() ? $until : null;
     }
 
     /**

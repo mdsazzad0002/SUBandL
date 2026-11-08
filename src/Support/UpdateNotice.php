@@ -32,6 +32,10 @@ class UpdateNotice
             'monthly_fee' => $check['monthly_fee'] ?? null,
             'checked_at' => now()->toDateTimeString(),
         ]);
+
+        // A new version: fetch its package in the background now, so
+        // installing it later does not have to wait for the download.
+        app(\SUBandL\Update\UpdateApplier::class)->schedulePrefetch($check);
     }
 
     /**

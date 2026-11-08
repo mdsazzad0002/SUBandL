@@ -8,6 +8,7 @@ use SUBandL\Events\UpdateFinished;
 use SUBandL\Models\ActivityLog;
 use SUBandL\Models\LicenseState;
 use SUBandL\Models\UpdateHistory;
+use SUBandL\Support\BackgroundArtisan;
 use SUBandL\Support\CliPhpBinary;
 use SUBandL\Support\HttpClient;
 use SUBandL\Support\Platform;
@@ -45,6 +46,9 @@ class UpdateApplier
 
     /** config('subandl.update.protected_paths'), read once per process. @var list<string>|null */
     private ?array $protectedPaths = null;
+
+    /** Extra listener for download progress (the background prefetch's status file). @var callable|null */
+    private $onDownloadProgress = null;
 
     public function __construct(private readonly BackupService $backupService)
     {
@@ -380,6 +384,7 @@ class UpdateApplier
         }
         if (! empty($download['zip']) && ($ok || ! ($download['verified'] ?? false))) {
             @unlink($download['zip']);
+            @unlink($download['zip'] . '.json');
         }
 
         LicenseState::current()->forceFill(['update_running' => false])->save();
@@ -473,44 +478,32 @@ class UpdateApplier
      */
     private function fetchPackage(array &$job, float $deadline): ?array
     {
-        if (! isset($job['download'])) {
-            $info = $job['info'];
-            $expected = is_string($info['checksum'] ?? null) && $info['checksum'] !== ''
-                ? strtolower($info['checksum'])
-                : null;
-            $version = preg_replace('/[^0-9A-Za-z._-]/', '', (string) ($info['latest_version'] ?? '')) ?: 'unknown';
-            $stagingDir = $this->stagingDir();
+        $info = $job['info'];
 
-            $this->cleanupStaging($stagingDir);
+        while (! isset($job['download'])) {
+            $this->cleanupStaging($this->stagingDir());
 
-            // Only a package with a known checksum can be trusted on a second run.
-            $zipPath = $stagingDir . DIRECTORY_SEPARATOR . ($expected
-                ? "update-{$version}-" . substr($expected, 0, 16) . '.zip'
-                : "update-{$version}-" . now()->format('YmdHis') . '.zip');
+            // Downloaded in the background already (see prefetch()): nothing to wait for.
+            if ($zip = $this->readyPackage($info, repair: true)) {
+                $job['download'] = ['zip' => $zip, 'verified' => true];
+                UpdateProgress::done('download', 'Downloaded in the background earlier (' . self::bytes(filesize($zip)) . ').');
 
-            if ($expected && is_file($zipPath)) {
-                UpdateProgress::stage('download', 50, 'Verifying the package downloaded earlier…');
-                if (hash_equals($expected, hash_file('sha256', $zipPath))) {
-                    $job['download'] = ['zip' => $zipPath, 'verified' => true];
-                    UpdateProgress::done('download', 'Reused the package downloaded earlier (' . self::bytes(filesize($zipPath)) . ').');
-
-                    return ['ok' => true];
-                }
-                @unlink($zipPath);
+                return ['ok' => true];
             }
 
-            $job['download'] = [
-                'url' => (string) $info['download_url'],
-                'zip' => $zipPath,
-                'part' => $zipPath . '.part',
-                'expected' => $expected,
-                'offset' => 0,
-                'total' => (int) ($info['size'] ?? $info['file_size'] ?? 0),
-                'verified' => false,
-            ];
-            @unlink($job['download']['part']);
-            UpdateProgress::stage('download', 0, 'Connecting…');
-            $job['download']['hash'] = null;
+            // The background download is still going: follow it rather than start a second one.
+            if ($this->prefetchRunning()) {
+                if (! $this->followPrefetch($deadline)) {
+                    return null; // still going; the next chunk looks again
+                }
+
+                continue; // it finished (ready) or stopped (download here, from where it got to)
+            }
+
+            $job['download'] = $this->newDownload($info);
+            UpdateProgress::stage('download', 0, $job['download']['offset'] > 0
+                ? 'Resuming at ' . self::bytes($job['download']['offset']) . '…'
+                : 'Connecting…');
         }
 
         $d = &$job['download'];
@@ -518,37 +511,78 @@ class UpdateApplier
             return ['ok' => true]; // reused package
         }
 
+        // Only one process downloads a package at a time (this, or the prefetch).
+        $lock = $this->downloadLock();
+        if ($lock === null) {
+            unset($job['download']); // a prefetch got in first: follow it next time
+
+            return $deadline === INF ? $this->fetchPackage($job, $deadline) : null;
+        }
+
         try {
             $received = $this->download($d, $deadline);
         } catch (\Illuminate\Http\Client\ConnectionException $e) {
             return ['ok' => false, 'message' => 'Update package download failed: ' . $e->getMessage()];
+        } finally {
+            $this->releaseLock($lock);
         }
 
         if ($received !== true) {
             return $received; // null (more to come) or the failure
         }
 
-        if ($d['expected']) {
-            // Hashed while it downloaded; only a job without that state reads the file again.
-            $context = isset($d['hash']) ? @unserialize(base64_decode($d['hash']), ['allowed_classes' => [\HashContext::class]]) : null;
-            if (! $context instanceof \HashContext) {
-                UpdateProgress::stage('download', 97, 'Verifying checksum…');
-            }
-            $actual = $context instanceof \HashContext ? hash_final($context) : hash_file('sha256', $d['part']);
-            unset($d['hash']);
-
-            if (! hash_equals($d['expected'], $actual)) {
-                return ['ok' => false, 'message' => 'Update package checksum mismatch — download is corrupt or was tampered with.'];
-            }
+        $done = $this->completeDownload($d, (string) ($info['latest_version'] ?? ''));
+        if ($done['ok']) {
+            UpdateProgress::done('download', 'Downloaded ' . self::bytes(filesize($d['zip'])) . '.');
         }
 
+        return $done;
+    }
+
+    /** A fresh download of the package — or the rest of one a prefetch or an earlier attempt left. */
+    private function newDownload(array $info): array
+    {
+        $zip = $this->packagePath($info);
+        $part = $zip . '.part';
+        clearstatcache();
+
+        return [
+            'url' => (string) $info['download_url'],
+            'zip' => $zip,
+            'part' => $part,
+            'expected' => $this->expectedChecksum($info),
+            'offset' => is_file($part) ? (int) filesize($part) : 0,
+            'total' => (int) ($info['size'] ?? $info['file_size'] ?? 0),
+            'verified' => false,
+            'hash' => null,
+        ];
+    }
+
+    /** Checks the finished .part file against the checksum, moves it into place and records it as ready. */
+    private function completeDownload(array &$d, string $version): array
+    {
+        // Hashed while it downloaded; only a resumed download without that state reads the file again.
+        $context = isset($d['hash']) ? @unserialize(base64_decode($d['hash']), ['allowed_classes' => [\HashContext::class]]) : null;
+        if (! $context instanceof \HashContext) {
+            UpdateProgress::stage('download', 97, 'Verifying checksum…');
+        }
+        $actual = $context instanceof \HashContext ? hash_final($context) : hash_file('sha256', $d['part']);
+        unset($d['hash']);
+
+        if ($d['expected'] && ! hash_equals($d['expected'], $actual)) {
+            @unlink($d['part']);
+
+            return ['ok' => false, 'message' => 'Update package checksum mismatch — download is corrupt or was tampered with.'];
+        }
+
+        @unlink($d['zip']);
         if (! @rename($d['part'], $d['zip'])) {
             return ['ok' => false, 'message' => "Could not move the downloaded package into '{$this->stagingDir()}'."];
         }
 
-        $d['verified'] = $d['expected'] !== null;
+        $this->writePackageMeta($d['zip'], $version, $actual);
+        $d['verified'] = true;
         unset($d['part']);
-        UpdateProgress::done('download', 'Downloaded ' . self::bytes(filesize($d['zip'])) . '.');
 
         return ['ok' => true];
     }
@@ -570,12 +604,11 @@ class UpdateApplier
     {
         $attempts = max(2, (int) config('subandl.live_attempts', 2));
         $failures = 0;
-        $hash = null;
-        if ($d['expected']) {
-            $hash = isset($d['hash']) ? @unserialize(base64_decode($d['hash']), ['allowed_classes' => [\HashContext::class]]) : null;
-            if (! $hash instanceof \HashContext) {
-                $hash = (int) $d['offset'] === 0 ? hash_init('sha256') : null; // null: hash_file() at the end
-            }
+        // Always hashed on the way in: the checksum to compare, or (without one) the
+        // fingerprint the ready-package record keeps.
+        $hash = isset($d['hash']) ? @unserialize(base64_decode($d['hash']), ['allowed_classes' => [\HashContext::class]]) : null;
+        if (! $hash instanceof \HashContext) {
+            $hash = (int) $d['offset'] === 0 ? hash_init('sha256') : null; // null: hash_file() at the end
         }
 
         while (true) {
@@ -600,12 +633,15 @@ class UpdateApplier
                 },
                 'progress' => function ($total, $received) use (&$d, $sink, &$answer) {
                     $got = (($answer[0] ?? null) === 'whole' ? 0 : (int) $d['offset']) + $sink->written;
-                    $all = ($answer[0] ?? null) === 'whole' ? ($answer[1] ?: (int) $total) : (int) $d['total'];
+                    $all = ($answer[0] ?? null) === 'whole' ? ($answer[1] ?: (int) $total) : (($answer[1] ?? 0) ?: (int) $d['total']);
                     UpdateProgress::stage(
                         'download',
                         $all > 0 ? 95 * $got / $all : 0,
                         $all > 0 ? self::bytes($got) . ' of ' . self::bytes($all) : self::bytes($got) . ' received'
                     );
+                    if ($this->onDownloadProgress) {
+                        ($this->onDownloadProgress)($got, $all);
+                    }
                 },
             ];
 
@@ -708,9 +744,382 @@ class UpdateApplier
 
         if ($result !== null && $result['ok']) {
             @unlink($zipPath);
+            @unlink($zipPath . '.json');
         }
 
         return $result;
+    }
+
+    /* ------------------------------------------------- background download */
+
+    /**
+     * Starts downloading the package of a version the provider just announced,
+     * in a detached process, so "Update now" later only has to install it.
+     * Called after every update check; does nothing when the package is
+     * already here or on its way, while an update runs, or for a locked
+     * version. Never throws: a check must not fail over this.
+     */
+    public function schedulePrefetch(array $check): void
+    {
+        try {
+            if (! config('subandl.update.prefetch', true)
+                || ! ($check['ok'] ?? false) || ! ($check['update_available'] ?? false)
+                || ($check['locked'] ?? false) || empty($check['download_url'])
+                || ! LicenseState::current()->updatesIncluded()
+                || $this->activeJob() || $this->prefetchRunning() || $this->backupService->isRunning()
+                || $this->packageStatus((string) ($check['latest_version'] ?? ''))['state'] === 'ready') {
+                return;
+            }
+
+            unset($check['raw']);
+            $dir = $this->stagingDir();
+            if (! is_dir($dir) && ! @mkdir($dir, 0755, true) && ! is_dir($dir)) {
+                return;
+            }
+            @file_put_contents($this->prefetchRequestPath(), json_encode(['check' => $check, 'at' => time()]));
+
+            if (! BackgroundArtisan::dispatch('subandl:update-prefetch')
+                && (Platform::functionEnabled('fastcgi_finish_request') || Platform::functionEnabled('litespeed_finish_request'))) {
+                // No way to spawn a process: download once this response has been sent.
+                app()->terminating(function () {
+                    Platform::allowLongRunning();
+                    $this->prefetch();
+                });
+            }
+        } catch (\Throwable $e) {
+            report($e);
+        }
+    }
+
+    /**
+     * The background preparation of the next version (subandl:update-prefetch):
+     *
+     *  1. download — resumes a partial download, verifies the checksum and
+     *     records the package as ready;
+     *  2. backup — the same pre-update backup the update itself runs (only
+     *     uploaded when one is due), so when the customer clicks Install the
+     *     backup stage finds it "not due" and passes at once. Should one be
+     *     due again by then, the update simply takes a fresh one.
+     *
+     * Only once both are done is the version reported 'ready' (and the
+     * widget asks the customer to install it). Progress goes to prefetch.json.
+     *
+     * @param array|null $check  the provider's update answer; null: the one schedulePrefetch() saved
+     */
+    public function prefetch(?array $check = null): array
+    {
+        if ($check === null) {
+            $saved = json_decode((string) @file_get_contents($this->prefetchRequestPath()), true);
+            $check = is_array($saved['check'] ?? null) ? $saved['check'] : null;
+        }
+        if (! $check || empty($check['download_url'])) {
+            return ['ok' => false, 'message' => 'No update to download.'];
+        }
+
+        $version = (string) ($check['latest_version'] ?? '');
+        if ($this->activeJob()) {
+            return ['ok' => true, 'skipped' => true, 'message' => 'An update is being installed; it prepares the package itself.'];
+        }
+
+        $download = $this->prefetchDownload($check, $version);
+        if (! ($download['ok'] ?? false) || ($download['skipped'] ?? false)) {
+            return $download;
+        }
+        $size = (int) $download['size'];
+
+        // 2. The backup, now that the package is here (closest to the install).
+        $this->writePrefetchStatus($version, 'backing-up', $size, $size);
+        try {
+            $backup = $this->backupService->runBackup();
+        } catch (\Throwable $e) {
+            $backup = ['ok' => false, 'message' => $e->getMessage()];
+        }
+
+        if (($backup['running'] ?? false) && $this->backupService->waitUntilIdle(60 * (int) config('subandl.update.backup_wait_minutes', 10))) {
+            $backup = ['ok' => true, 'message' => 'Used the backup that was already running.'];
+        }
+
+        $backupNote = ($backup['ok'] ?? false)
+            ? (($backup['skipped'] ?? false) ? 'backup not due (' . ($backup['message'] ?? 'skipped') . ')' : 'backup uploaded')
+            : 'backup failed: ' . ($backup['message'] ?? 'unknown error') . ' — it is retried during the update';
+        $this->writePrefetchStatus($version, 'ready', $size, $size, ($backup['ok'] ?? false) ? null : $backupNote);
+        ActivityLog::record('update', true, "v{$version} prepared in the background: package downloaded (" . self::bytes($size) . "), {$backupNote}. Ready to install.");
+
+        return ['ok' => true, 'message' => "v{$version} is ready to install ({$backupNote})."];
+    }
+
+    /**
+     * Step 1 of prefetch(): the package itself.
+     *
+     * @return array{ok: bool, message?: string, skipped?: bool, size?: int}
+     */
+    private function prefetchDownload(array $check, string $version): array
+    {
+        if ($zip = $this->readyPackage($check, repair: true)) {
+            return ['ok' => true, 'size' => (int) filesize($zip)];
+        }
+
+        $lock = $this->downloadLock();
+        if ($lock === null) {
+            return ['ok' => true, 'skipped' => true, 'message' => 'The package is already being downloaded.'];
+        }
+
+        try {
+            $dir = $this->stagingDir();
+            if (! is_dir($dir) && ! @mkdir($dir, 0755, true) && ! is_dir($dir)) {
+                return ['ok' => false, 'message' => "Could not create the update staging folder '{$dir}'."];
+            }
+            $this->cleanupStaging($dir);
+
+            $d = $this->newDownload($check);
+            $this->writePrefetchStatus($version, 'downloading', $d['offset'], $d['total']);
+            $writtenAt = 0.0;
+            $this->onDownloadProgress = function (int $got, int $all) use ($version, &$writtenAt) {
+                if (microtime(true) - $writtenAt >= 1.0) {
+                    $writtenAt = microtime(true);
+                    $this->writePrefetchStatus($version, 'downloading', $got, $all);
+                }
+            };
+
+            try {
+                $received = $this->download($d, INF);
+                $result = $received === true ? $this->completeDownload($d, $version) : $received;
+            } catch (\Throwable $e) {
+                $result = ['ok' => false, 'message' => 'Update package download failed: ' . $e->getMessage()];
+            }
+
+            if ($result['ok'] ?? false) {
+                return ['ok' => true, 'size' => (int) filesize($d['zip'])];
+            }
+
+            $this->writePrefetchStatus($version, 'failed', (int) ($d['offset'] ?? 0), (int) ($d['total'] ?? 0), $result['message'] ?? null);
+            ActivityLog::record('update', false, "Background download of v{$version} failed: " . ($result['message'] ?? 'unknown error') . ' It is downloaded during the update instead.');
+
+            return ['ok' => false, 'message' => $result['message'] ?? 'Download failed.'];
+        } finally {
+            $this->onDownloadProgress = null;
+            $this->releaseLock($lock);
+        }
+    }
+
+    /**
+     * What the widget shows about the next version's background preparation:
+     * downloading → backing-up → ready (failed: the download did not work and
+     * happens during the update instead; null: nothing prepared).
+     *
+     * @return array{state: ?string, received: int, total: int, message: ?string}
+     */
+    public function packageStatus(?string $version): array
+    {
+        $status = ['state' => null, 'received' => 0, 'total' => 0, 'message' => null];
+        if (! $version) {
+            return $status;
+        }
+
+        $saved = json_decode((string) @file_get_contents($this->prefetchStatusPath()), true);
+        $saved = is_array($saved) && ($saved['version'] ?? null) === $version ? $saved : null;
+
+        $tag = preg_replace('/[^0-9A-Za-z._-]/', '', $version);
+        foreach (glob($this->stagingDir() . DIRECTORY_SEPARATOR . "update-{$tag}-*.zip") ?: [] as $zip) {
+            $meta = $this->packageMeta($zip);
+            if ($meta === null || ($meta['version'] ?? null) !== $version) {
+                continue;
+            }
+
+            // The package is here; while the background backup still runs it is not ready yet.
+            // (The first seconds count too: the backup may not have claimed its flag yet.)
+            $backingUp = ($saved['state'] ?? null) === 'backing-up'
+                && ($this->backupService->isRunning() || (int) ($saved['at'] ?? 0) > time() - 30);
+
+            return [
+                'state' => $backingUp ? 'backing-up' : 'ready',
+                'received' => $meta['size'],
+                'total' => $meta['size'],
+                'message' => $saved['message'] ?? null,
+            ];
+        }
+
+        if ($saved !== null) {
+            $status = [
+                'state' => $this->prefetchRunning() ? 'downloading' : (($saved['state'] ?? null) === 'failed' ? 'failed' : null),
+                'received' => (int) ($saved['received'] ?? 0),
+                'total' => (int) ($saved['total'] ?? 0),
+                'message' => $saved['message'] ?? null,
+            ];
+        }
+
+        return $status;
+    }
+
+    /**
+     * The package of $info when it is here, complete and matches the expected
+     * checksum — known from the record written when it finished, without
+     * reading the file again. $repair: an older package that has no record is
+     * checked once by hashing it; one that fails is removed.
+     */
+    private function readyPackage(array $info, bool $repair = false): ?string
+    {
+        $zip = $this->packagePath($info);
+        clearstatcache();
+        if (! is_file($zip)) {
+            return null;
+        }
+
+        $expected = $this->expectedChecksum($info);
+        $meta = $this->packageMeta($zip);
+        if ($meta !== null && ($meta['version'] ?? null) === (string) ($info['latest_version'] ?? '')
+            && ($expected === null || hash_equals($expected, (string) $meta['sha256']))) {
+            return $zip;
+        }
+
+        if (! $repair) {
+            return null;
+        }
+
+        if ($expected) {
+            UpdateProgress::stage('download', 50, 'Verifying the package downloaded earlier…');
+            if (hash_equals($expected, hash_file('sha256', $zip))) {
+                $this->writePackageMeta($zip, (string) ($info['latest_version'] ?? ''), $expected);
+
+                return $zip;
+            }
+        }
+
+        @unlink($zip);
+        @unlink($zip . '.json');
+
+        return null;
+    }
+
+    /** The record of a finished package, while the file is still exactly what was recorded. */
+    private function packageMeta(string $zip): ?array
+    {
+        $meta = json_decode((string) @file_get_contents($zip . '.json'), true);
+        clearstatcache(false, $zip);
+
+        return is_array($meta) && isset($meta['sha256'], $meta['size'], $meta['mtime'])
+            && @filesize($zip) === $meta['size'] && @filemtime($zip) === $meta['mtime']
+            ? $meta
+            : null;
+    }
+
+    private function writePackageMeta(string $zip, string $version, string $sha256): void
+    {
+        clearstatcache(false, $zip);
+        @file_put_contents($zip . '.json', json_encode([
+            'version' => $version,
+            'sha256' => strtolower($sha256),
+            'size' => (int) filesize($zip),
+            'mtime' => (int) filemtime($zip),
+        ]));
+    }
+
+    /**
+     * Waits (within the chunk's budget) for the background download,
+     * mirroring its progress into the update's download stage.
+     *
+     * @return bool true once it is no longer running
+     */
+    private function followPrefetch(float $deadline): bool
+    {
+        while ($this->prefetchRunning()) {
+            $saved = json_decode((string) @file_get_contents($this->prefetchStatusPath()), true) ?: [];
+            $got = (int) ($saved['received'] ?? 0);
+            $all = (int) ($saved['total'] ?? 0);
+            UpdateProgress::stage(
+                'download',
+                $all > 0 ? 95 * $got / $all : 0,
+                'Finishing the background download… ' . ($all > 0 ? self::bytes($got) . ' of ' . self::bytes($all) : self::bytes($got))
+            );
+
+            if (microtime(true) >= $deadline) {
+                return false;
+            }
+            usleep(500000);
+        }
+
+        return true;
+    }
+
+    private function packagePath(array $info): string
+    {
+        $version = preg_replace('/[^0-9A-Za-z._-]/', '', (string) ($info['latest_version'] ?? '')) ?: 'unknown';
+        $expected = $this->expectedChecksum($info);
+
+        return $this->stagingDir() . DIRECTORY_SEPARATOR . "update-{$version}-" . ($expected ? substr($expected, 0, 16) : 'nosum') . '.zip';
+    }
+
+    private function expectedChecksum(array $info): ?string
+    {
+        return is_string($info['checksum'] ?? null) && $info['checksum'] !== '' ? strtolower($info['checksum']) : null;
+    }
+
+    /** The download lock (flock, so it is released even when the process dies); null when taken. */
+    private function downloadLock()
+    {
+        $dir = $this->stagingDir();
+        if (! is_dir($dir) && ! @mkdir($dir, 0755, true) && ! is_dir($dir)) {
+            return null;
+        }
+
+        $handle = @fopen($dir . DIRECTORY_SEPARATOR . 'download.lock', 'c');
+        if ($handle === false) {
+            return null;
+        }
+        if (! flock($handle, LOCK_EX | LOCK_NB)) {
+            fclose($handle);
+
+            return null;
+        }
+
+        return $handle;
+    }
+
+    private function releaseLock($handle): void
+    {
+        if (is_resource($handle)) {
+            flock($handle, LOCK_UN);
+            fclose($handle);
+        }
+    }
+
+    /** Whether some process holds the download lock right now. */
+    public function prefetchRunning(): bool
+    {
+        $path = $this->stagingDir() . DIRECTORY_SEPARATOR . 'download.lock';
+        if (! is_file($path)) {
+            return false;
+        }
+
+        $lock = $this->downloadLock();
+        if ($lock === null) {
+            return true;
+        }
+        $this->releaseLock($lock);
+
+        return false;
+    }
+
+    private function writePrefetchStatus(string $version, string $state, int $received, int $total, ?string $message = null): void
+    {
+        @file_put_contents($this->prefetchStatusPath(), json_encode([
+            'version' => $version,
+            'state' => $state,
+            'received' => $received,
+            'total' => $total,
+            'message' => $message,
+            'at' => time(),
+        ]));
+    }
+
+    private function prefetchStatusPath(): string
+    {
+        return $this->stagingDir() . DIRECTORY_SEPARATOR . 'prefetch.json';
+    }
+
+    private function prefetchRequestPath(): string
+    {
+        return $this->stagingDir() . DIRECTORY_SEPARATOR . 'prefetch-request.json';
     }
 
     private function stagingDir(): string
@@ -750,11 +1159,22 @@ class UpdateApplier
         @unlink($this->jobPath());
     }
 
-    /** Drops packages and partial downloads older than a day (an abandoned version). */
+    /**
+     * Drops packages (and partial downloads) of versions already installed,
+     * and anything a week old. A package downloaded in the background for
+     * the version still to come is kept until it is installed.
+     */
     private function cleanupStaging(string $stagingDir): void
     {
+        $current = (string) config('subandl.version', '1.0.0');
+
         foreach (glob($stagingDir . DIRECTORY_SEPARATOR . 'update-*') ?: [] as $file) {
-            if (is_file($file) && filemtime($file) < time() - 86400) {
+            if (! is_file($file)) {
+                continue;
+            }
+            $installed = preg_match('/^update-(.+)-(?:[0-9a-f]{16}|nosum|\d{14})\.zip/', basename($file), $m)
+                && version_compare($m[1], $current, '<=');
+            if ($installed || filemtime($file) < time() - 7 * 86400) {
                 @unlink($file);
             }
         }

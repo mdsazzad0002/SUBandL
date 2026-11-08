@@ -76,15 +76,26 @@ class LicenseState extends Model
      */
     public static function current(): self
     {
-        return Cache::remember(self::CACHE_KEY, now()->addMinutes(self::CACHE_MINUTES), function () {
+        // The row's attributes are cached, not the model: Laravel 13 refuses to
+        // unserialize objects from the cache (cache.serializable_classes = false)
+        // and hands back __PHP_Incomplete_Class instead.
+        $load = fn () => static::query()->firstOrCreate([], [
             // The configured license key is only ever read here — as the ONE-TIME seed
             // value when the row doesn't exist yet (a brand-new install). Once the row
             // exists it never overrides a key saved afterwards.
-            return static::query()->firstOrCreate([], [
-                'status' => 'unverified',
-                'license_key' => config('subandl.license_key'),
-            ]);
-        });
+            'status' => 'unverified',
+            'license_key' => config('subandl.license_key'),
+        ])->getAttributes();
+
+        $attributes = Cache::remember(self::CACHE_KEY, now()->addMinutes(self::CACHE_MINUTES), $load);
+
+        if (! is_array($attributes)) {
+            // A model cached by an older version (or an incomplete object): replace it.
+            Cache::forget(self::CACHE_KEY);
+            $attributes = Cache::remember(self::CACHE_KEY, now()->addMinutes(self::CACHE_MINUTES), $load);
+        }
+
+        return (new static())->newFromBuilder($attributes);
     }
 
     protected static function booted(): void

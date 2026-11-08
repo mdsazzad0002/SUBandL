@@ -81,6 +81,8 @@ class WidgetController extends Controller
                 'currency' => $state->billing()['currency'] ?? ($state->payment_info['currency'] ?? 'BDT'),
                 'checked_at' => $notice['checked_at'],
                 'running' => $updater->isRunning($state),
+                // Downloaded in the background ahead of time: ready | downloading | failed | null.
+                'package' => $notice['available'] ? $updater->packageStatus($notice['latest_version']) : null,
                 'updates_included' => $state->updatesIncluded(),
                 'retry_at' => optional($health->backoffUntil())->toDateTimeString(),
                 // The last server-side health ping before a live call.

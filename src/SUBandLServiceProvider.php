@@ -41,6 +41,7 @@ class SUBandLServiceProvider extends ServiceProvider
                 Console\StatusCommand::class,
                 Console\LicenseCheckCommand::class,
                 Console\UpdateCheckCommand::class,
+                Console\UpdatePrefetchCommand::class,
                 Console\BackupCommand::class,
                 Console\InstallerGenerateCommand::class,
             ]);
