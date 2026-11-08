@@ -123,11 +123,19 @@ export function createSubandl({ base = '' } = {}) {
     function watchProgress(run, onTick) {
         let stopped = false;
         (async () => {
+            let slow = 0;
             while (!stopped) {
                 await sleep(700);
                 if (stopped) break;
+                const started = Date.now();
                 const r = await request('GET', '/license/update/status');
                 if (!stopped && r.ok && r.data.progress && r.data.progress.run === run) onTick(r.data.progress);
+                // A poll that only gets answered after a whole chunk means the server
+                // takes one request at a time (`php artisan serve` on Windows): each
+                // poll would then cost the update a full request. Stop — every chunk
+                // response carries the progress anyway.
+                slow = Date.now() - started > 2500 ? slow + 1 : 0;
+                if (slow >= 2) break;
             }
         })();
         return () => {

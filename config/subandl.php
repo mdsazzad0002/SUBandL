@@ -305,8 +305,6 @@ return [
         // IIS: 30-60s) and a single-threaded `php artisan serve` on Windows
         // can still answer the progress bar. The CLI/scheduler runs in one go.
         'chunk_seconds' => (int) env('SUBANDL_UPDATE_CHUNK_SECONDS', 10),
-        // The package is downloaded in HTTP Range slices of this size.
-        'download_chunk_bytes' => 8 * 1024 * 1024,
 
         // A backup already running when an update starts (scheduler, the
         // "Backup now" button) is waited for this long instead of rejecting

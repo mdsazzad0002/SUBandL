@@ -43,6 +43,9 @@ class UpdateApplier
     /** Folders already known to exist during this merge. @var array<string, true> */
     private array $knownDirs = [];
 
+    /** config('subandl.update.protected_paths'), read once per process. @var list<string>|null */
+    private ?array $protectedPaths = null;
+
     public function __construct(private readonly BackupService $backupService)
     {
     }
@@ -374,7 +377,6 @@ class UpdateApplier
         $download = $job['download'] ?? [];
         if (! empty($download['part'])) {
             @unlink($download['part']);
-            @unlink($download['part'] . '.chunk');
         }
         if (! empty($download['zip']) && ($ok || ! ($download['verified'] ?? false))) {
             @unlink($download['zip']);
@@ -465,9 +467,7 @@ class UpdateApplier
     /**
      * Gets the package into staging: reuses one an earlier attempt already
      * downloaded when its checksum still matches, otherwise streams it to disk
-     * — in one request on the CLI, or in Range-request slices of
-     * download_chunk_bytes appended to a .part file in chunked mode (a server
-     * that ignores Range just sends the whole file in the first slice).
+     * (see download()) and checks it against the hash built on the way in.
      *
      * @return array{ok: bool, message?: string}|null null when more is left for the next chunk
      */
@@ -510,6 +510,7 @@ class UpdateApplier
             ];
             @unlink($job['download']['part']);
             UpdateProgress::stage('download', 0, 'Connecting…');
+            $job['download']['hash'] = null;
         }
 
         $d = &$job['download'];
@@ -518,7 +519,7 @@ class UpdateApplier
         }
 
         try {
-            $received = $deadline === INF ? $this->downloadWhole($d) : $this->downloadSlices($d, $deadline);
+            $received = $this->download($d, $deadline);
         } catch (\Illuminate\Http\Client\ConnectionException $e) {
             return ['ok' => false, 'message' => 'Update package download failed: ' . $e->getMessage()];
         }
@@ -527,9 +528,18 @@ class UpdateApplier
             return $received; // null (more to come) or the failure
         }
 
-        UpdateProgress::stage('download', 97, 'Verifying checksum…');
-        if ($d['expected'] && ! hash_equals($d['expected'], hash_file('sha256', $d['part']))) {
-            return ['ok' => false, 'message' => 'Update package checksum mismatch — download is corrupt or was tampered with.'];
+        if ($d['expected']) {
+            // Hashed while it downloaded; only a job without that state reads the file again.
+            $context = isset($d['hash']) ? @unserialize(base64_decode($d['hash']), ['allowed_classes' => [\HashContext::class]]) : null;
+            if (! $context instanceof \HashContext) {
+                UpdateProgress::stage('download', 97, 'Verifying checksum…');
+            }
+            $actual = $context instanceof \HashContext ? hash_final($context) : hash_file('sha256', $d['part']);
+            unset($d['hash']);
+
+            if (! hash_equals($d['expected'], $actual)) {
+                return ['ok' => false, 'message' => 'Update package checksum mismatch — download is corrupt or was tampered with.'];
+            }
         }
 
         if (! @rename($d['part'], $d['zip'])) {
@@ -543,135 +553,130 @@ class UpdateApplier
         return ['ok' => true];
     }
 
-    /** @return true|array true when the whole package is in the .part file, else the failure */
-    private function downloadWhole(array &$d): bool|array
+    /**
+     * Streams the package into the .part file. In chunked mode it is ONE
+     * request per chunk — `Range: bytes=<offset>-`, cut off when the budget
+     * runs out — rather than one request per slice, so a slow link to the
+     * provider pays its connection setup once per chunk. Whatever arrived
+     * is kept (and hashed), so the next chunk, or a retry after the
+     * connection dropped, carries on from the byte where it stopped. A
+     * server that ignores Range sends the whole file, which restarts at 0.
+     *
+     * @return bool|array|null true when complete, null when the budget ran out, else the failure
+     *
+     * @throws \Illuminate\Http\Client\ConnectionException after live_attempts failures without progress
+     */
+    private function download(array &$d, float $deadline): bool|array|null
     {
-        $response = $this->getPackage($d['url'], $d['part'], function ($total, $received) use ($d) {
-            $total = $total ?: $d['total'];
-            UpdateProgress::stage(
-                'download',
-                $total > 0 ? 95 * $received / $total : 0,
-                $total > 0 ? self::bytes($received) . ' of ' . self::bytes($total) : self::bytes($received) . ' received'
-            );
-        });
-
-        if (! $response->successful()) {
-            return ['ok' => false, 'message' => 'Update package download failed (HTTP ' . $response->status() . ').'];
+        $attempts = max(2, (int) config('subandl.live_attempts', 2));
+        $failures = 0;
+        $hash = null;
+        if ($d['expected']) {
+            $hash = isset($d['hash']) ? @unserialize(base64_decode($d['hash']), ['allowed_classes' => [\HashContext::class]]) : null;
+            if (! $hash instanceof \HashContext) {
+                $hash = (int) $d['offset'] === 0 ? hash_init('sha256') : null; // null: hash_file() at the end
+            }
         }
-
-        return true;
-    }
-
-    /** @return true|array|null true when complete, null when the budget ran out first, else the failure */
-    private function downloadSlices(array &$d, float $deadline): bool|array|null
-    {
-        $sliceBytes = max(256 * 1024, (int) config('subandl.update.download_chunk_bytes', 8 * 1024 * 1024));
-        $slicePath = $d['part'] . '.chunk';
 
         while (true) {
             $from = (int) $d['offset'];
-            $response = $this->getPackage($d['url'], $slicePath, function ($total, $received) use ($d, $from) {
-                $all = (int) $d['total'];
-                $got = $from + $received;
-                UpdateProgress::stage(
-                    'download',
-                    $all > 0 ? 95 * $got / $all : 0,
-                    $all > 0 ? self::bytes($got) . ' of ' . self::bytes($all) : self::bytes($got) . ' received'
-                );
-            }, ['Range' => 'bytes=' . $from . '-' . ($from + $sliceBytes - 1)]);
+            $sink = new PackageSink($d['part'], $from, $hash, $deadline);
+            $answer = null;
 
-            $status = $response->status();
-            clearstatcache();
-            $size = (int) @filesize($slicePath);
+            $options = [
+                'sink' => $sink,
+                // Status and range are known before the body: only the right bytes are kept.
+                'on_headers' => function ($response) use ($sink, $from, &$answer) {
+                    $status = $response->getStatusCode();
+                    if ($status === 206 && preg_match('#bytes\s+(\d+)-\d+/(\d+|\*)#i', $response->getHeaderLine('Content-Range'), $m) && (int) $m[1] === $from) {
+                        $answer = ['partial', $m[2] === '*' ? 0 : (int) $m[2]];
+                        $sink->accept();
+                    } elseif ($status === 200) {
+                        $answer = ['whole', (int) $response->getHeaderLine('Content-Length')];
+                        $sink->restart();
+                    } else {
+                        $answer = [$status === 206 ? 'bad-range' : 'status', $status];
+                    }
+                },
+                'progress' => function ($total, $received) use (&$d, $sink, &$answer) {
+                    $got = (($answer[0] ?? null) === 'whole' ? 0 : (int) $d['offset']) + $sink->written;
+                    $all = ($answer[0] ?? null) === 'whole' ? ($answer[1] ?: (int) $total) : (int) $d['total'];
+                    UpdateProgress::stage(
+                        'download',
+                        $all > 0 ? 95 * $got / $all : 0,
+                        $all > 0 ? self::bytes($got) . ' of ' . self::bytes($all) : self::bytes($got) . ' received'
+                    );
+                },
+            ];
 
-            if ($status === 206) {
-                if (! preg_match('#bytes\s+(\d+)-(\d+)/(\d+|\*)#i', (string) $response->header('Content-Range'), $m) || (int) $m[1] !== $from) {
-                    @unlink($slicePath);
+            $error = null;
+            try {
+                HttpClient::request()->timeout((int) config('subandl.update.download_timeout', 300))
+                    ->withHeaders($from > 0 || $deadline !== INF ? ['Range' => "bytes={$from}-"] : [])
+                    ->withOptions($options)
+                    ->get($d['url']);
+            } catch (\Throwable $e) {
+                $error = $sink->budgetSpent ? null : $e;
+            } finally {
+                $sink->close();
+            }
+            $budgetSpent = $sink->budgetSpent;
 
-                    return ['ok' => false, 'message' => 'Update package download failed (the server sent an unexpected byte range).'];
-                }
+            [$kind, $value] = $answer ?? [null, null];
+            if ($kind === 'whole') {
+                $d['offset'] = 0;
+                $d['total'] = $value;
+            } elseif ($kind === 'partial' && $value > 0) {
+                $d['total'] = $value;
+            }
+            $d['offset'] = (int) $d['offset'] + $sink->written;
+            $hash = $sink->hash();
+            $d['hash'] = $hash ? base64_encode(serialize($hash)) : null;
 
-                if (! $this->appendFile($slicePath, $d['part'])) {
-                    return ['ok' => false, 'message' => "Could not write the download into '{$this->stagingDir()}'."];
-                }
-                $d['offset'] = $from + $size;
-                if ($m[3] !== '*') {
-                    $d['total'] = (int) $m[3];
-                }
-                $complete = $d['total'] > 0 ? $d['offset'] >= $d['total'] : $size < $sliceBytes;
-            } elseif ($status === 200) {
-                // Range not supported: this one response is the whole package.
-                @unlink($d['part']);
-                if (! @rename($slicePath, $d['part'])) {
-                    return ['ok' => false, 'message' => "Could not write the download into '{$this->stagingDir()}'."];
-                }
-                $d['offset'] = $d['total'] = $size;
-                $complete = true;
-            } elseif ($status === 416 && $from > 0) {
-                // Asked past the end: everything is already here.
-                @unlink($slicePath);
-                $complete = true;
-            } else {
-                @unlink($slicePath);
-
-                return ['ok' => false, 'message' => 'Update package download failed (HTTP ' . $status . ').'];
+            if ($sink->diskError) {
+                return ['ok' => false, 'message' => "Could not write the download into '{$this->stagingDir()}' (disk full or no permission)."];
+            }
+            if ($kind === 'status' && $value === 416 && $from > 0) {
+                return true; // asked past the end: everything is already here
+            }
+            if ($kind === 'bad-range') {
+                return ['ok' => false, 'message' => 'Update package download failed (the server sent an unexpected byte range).'];
+            }
+            if ($kind === 'status' && ($value < 500 || ++$failures >= $attempts)) {
+                return ['ok' => false, 'message' => "Update package download failed (HTTP {$value})."];
             }
 
+            $complete = $error === null && ! $budgetSpent && $kind !== 'status'
+                && ((int) $d['total'] <= 0 || (int) $d['offset'] >= (int) $d['total']);
             if ($complete) {
                 return true;
             }
-            if (microtime(true) >= $deadline) {
+            if ($budgetSpent) {
                 return null;
             }
-        }
-    }
 
-    /**
-     * One GET streamed to $sink, tried at least twice on a connection error
-     * or 5xx before giving up.
-     *
-     * @throws \Illuminate\Http\Client\ConnectionException
-     */
-    private function getPackage(string $url, string $sink, callable $progress, array $headers = []): \Illuminate\Http\Client\Response
-    {
-        $attempts = max(2, (int) config('subandl.live_attempts', 2));
-
-        for ($attempt = 1; ; $attempt++) {
-            try {
-                $response = HttpClient::request()->timeout((int) config('subandl.update.download_timeout', 300))
-                    ->withHeaders($headers)
-                    ->withOptions(['progress' => $progress])
-                    ->sink($sink)
-                    ->get($url);
-
-                if (! $response->serverError() || $attempt >= $attempts) {
-                    return $response;
+            // Connection dropped, timed out or a 5xx: bytes that arrived count as
+            // progress; giving up only after live_attempts tries that got nothing.
+            if ($sink->written === 0 && $kind !== 'status' && ++$failures >= $attempts) {
+                ActivityLog::record('update', false, "Package download failed after {$failures} attempts: " . ($error ? $error->getMessage() : 'connection closed early'));
+                if ($error instanceof \Illuminate\Http\Client\ConnectionException) {
+                    throw $error;
                 }
-                $reason = 'HTTP ' . $response->status();
-            } catch (\Illuminate\Http\Client\ConnectionException $e) {
-                if ($attempt >= $attempts) {
-                    ActivityLog::record('update', false, "Package download failed after {$attempt} attempts: {$e->getMessage()}");
-                    throw $e;
-                }
-                $reason = $e->getMessage();
+
+                return ['ok' => false, 'message' => 'Update package download failed: ' . ($error ? $error->getMessage() : 'the connection closed early.')];
             }
 
-            ActivityLog::record('update', false, "Package download attempt {$attempt} failed ({$reason}); retrying.");
-            UpdateProgress::stage('download', 0, "Attempt {$attempt} failed ({$reason}); retrying…");
-            sleep((int) config('subandl.live_retry_delay_seconds', 2));
+            $reason = $kind === 'status' ? "HTTP {$value}" : ($error ? $error->getMessage() : 'connection closed early');
+            ActivityLog::record('update', false, "Package download interrupted at " . self::bytes($d['offset']) . " ({$reason}); continuing.");
+            UpdateProgress::stage('download', 0, "Interrupted ({$reason}); continuing…");
+            if ($deadline !== INF && microtime(true) >= $deadline) {
+                return null;
+            }
+            // Bytes got through: the link works, so carry on at once.
+            if ($sink->written === 0) {
+                sleep((int) config('subandl.live_retry_delay_seconds', 2));
+            }
         }
-    }
-
-    private function appendFile(string $from, string $to): bool
-    {
-        $in = @fopen($from, 'rb');
-        $out = @fopen($to, 'ab');
-        $ok = $in !== false && $out !== false && stream_copy_to_stream($in, $out) !== false;
-        $in && fclose($in);
-        $out && fclose($out);
-        @unlink($from);
-
-        return $ok;
     }
 
     /**
@@ -781,11 +786,12 @@ class UpdateApplier
     {
         $path = ltrim(str_replace('\\', '/', trim($path)), '/');
 
-        if ($path === '' || preg_match('#(^|/)\.\.(/|$)#', $path) || preg_match('#^[A-Za-z]:#', $path)) {
+        if ($path === '' || (str_contains($path, '..') && preg_match('#(^|/)\.\.(/|$)#', $path)) || (isset($path[1]) && $path[1] === ':')) {
             return null;
         }
 
-        foreach ((array) config('subandl.update.protected_paths', []) as $prefix) {
+        $this->protectedPaths ??= array_values(array_filter(array_map('strval', (array) config('subandl.update.protected_paths', [])), 'strlen'));
+        foreach ($this->protectedPaths as $prefix) {
             if ($path === rtrim($prefix, '/') || str_starts_with($path, $prefix)) {
                 return null;
             }
@@ -844,9 +850,13 @@ class UpdateApplier
                 }
 
                 [$i, $stat, $relative] = $entries[$n];
-                if ($this->isUnchanged($stat, $destination . '/' . $relative, $manifest[$relative] ?? null)) {
+                $unchanged = $this->isUnchanged($stat, $destination . '/' . $relative, $manifest[$relative] ?? null, $trusted);
+                if ($unchanged) {
                     $cursor['unchanged']++;
-                    $seen[$relative] = $stat;
+                    // A file the manifest already vouched for needs no new entry.
+                    if (! $trusted) {
+                        $seen[$relative] = $stat;
+                    }
                 } else {
                     $cursor['changed'][] = $i;
                     $cursor['changed_bytes'] += (int) $stat['size'];
@@ -914,9 +924,11 @@ class UpdateApplier
 
     /**
      * @param array{0: int, 1: int, 2: int}|null $known  [size, mtime, crc] the manifest holds for this file
+     * @param bool $trusted  set to whether the manifest alone answered (the file was not read)
      */
-    private function isUnchanged(array $stat, string $target, ?array $known): bool
+    private function isUnchanged(array $stat, string $target, ?array $known, ?bool &$trusted = null): bool
     {
+        $trusted = false;
         if (str_ends_with($stat['name'], '/')) {
             return is_dir($target);
         }
@@ -930,7 +942,9 @@ class UpdateApplier
 
         // Untouched since the last merge wrote or checked it: its CRC is known.
         if ($known !== null && $known[0] === $size && $known[1] === @filemtime($target)) {
-            return $known[2] === $crc;
+            $trusted = $known[2] === $crc;
+
+            return $trusted;
         }
 
         $hash = @hash_file('crc32b', $target);
@@ -957,6 +971,10 @@ class UpdateApplier
     /** @param array<string, array> $seen  relative path => zip stat, for every file now matching the package */
     private function saveManifest(string $destination, array $manifest, array $seen): void
     {
+        if ($seen === []) {
+            return; // nothing new: skip encoding and rewriting the whole file
+        }
+
         clearstatcache();
         foreach ($seen as $relative => $stat) {
             if (str_ends_with($stat['name'], '/')) {

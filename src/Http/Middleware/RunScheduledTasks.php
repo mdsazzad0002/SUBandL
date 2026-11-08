@@ -28,7 +28,7 @@ class RunScheduledTasks
     {
         if (! config('subandl.middleware.web_scheduler', true)
             || ! $request->isMethod('GET')
-            || $request->routeIs('subandl.asset')) {
+            || $request->routeIs('subandl.asset', 'license.update.status')) {
             return $next($request);
         }
 
