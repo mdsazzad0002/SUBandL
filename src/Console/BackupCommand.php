@@ -9,7 +9,8 @@ use SUBandL\Support\Platform;
 
 class BackupCommand extends Command
 {
-    protected $signature = 'subandl:backup {--force : Run now, regardless of schedule or the customer toggle}';
+    protected $signature = 'subandl:backup {--force : Run now, regardless of schedule or the customer toggle}
+                                           {--before-update= : (internal) the backup an update started in the background, for that update run}';
 
     protected $description = 'Upload a database backup to the provider when due and enabled.';
 
@@ -18,7 +19,10 @@ class BackupCommand extends Command
         // A large dump + chunked upload can legitimately take minutes.
         Platform::allowLongRunning();
 
-        $result = $service->runBackup(force: (bool) $this->option('force'));
+        $run = $this->option('before-update');
+        $result = is_string($run) && $run !== ''
+            ? $service->runBeforeUpdate($run)
+            : $service->runBackup(force: (bool) $this->option('force'));
 
         if ($result['skipped'] ?? false) {
             $this->info('Backup skipped: ' . ($result['message'] ?? 'not due.'));

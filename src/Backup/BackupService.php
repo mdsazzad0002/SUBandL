@@ -222,7 +222,7 @@ class BackupService
      * @param bool $beforeUpdate  the updater's own pre-update backup, which must
      *                            not be held back by the update it belongs to
      */
-    public function runBackup(bool $force = false, bool $beforeUpdate = false): array
+    public function runBackup(bool $force = false, bool $beforeUpdate = false, ?callable $onDumped = null): array
     {
         $state = LicenseState::current();
 
@@ -291,17 +291,106 @@ class BackupService
             return $result;
         }
 
+        // The database is saved: whoever waits for the snapshot (the updater,
+        // before it migrates) can go on; the upload follows.
+        if ($onDumped) {
+            $onDumped($dump['path']);
+        }
+
+        $kept = null;
         try {
             $result = $this->upload($dump['path']);
         } catch (\Throwable $e) {
             $result = ['ok' => false, 'message' => 'Backup upload failed: ' . $e->getMessage()];
         } finally {
+            // A pre-update snapshot the provider did not get is the only copy of
+            // the data from before the update: keep it on disk instead.
+            if (! ($result['ok'] ?? false) && $beforeUpdate) {
+                $kept = $this->stagingPath() . DIRECTORY_SEPARATOR . 'kept-' . basename($dump['path']);
+                @rename($dump['path'], $kept) || $kept = null;
+            }
             @unlink($dump['path']);
+        }
+        if ($kept) {
+            $result['message'] = ($result['message'] ?? 'Upload failed.') . " The pre-update dump is kept at {$kept}.";
         }
 
         $this->recordResult($state, $result);
 
         return $result;
+    }
+
+    /**
+     * The updater's backup, run as a detached process (subandl:backup
+     * --before-update=<run>) while the update downloads and merges. The
+     * snapshot is what matters before migrations; it is signalled through the
+     * gate file as soon as the dump exists, and the upload continues here in
+     * the background. Same rules as before: only uploaded when one is due; a
+     * backup already running is waited for and counts.
+     */
+    public function runBeforeUpdate(string $run): array
+    {
+        $this->writeGate($run, 'dumping');
+
+        for ($attempt = 1; $attempt <= 3; $attempt++) {
+            if ($this->isRunning()) {
+                $this->writeGate($run, 'waiting', 'Waiting for the backup already running…');
+                if (! $this->waitUntilIdle(60 * (int) config('subandl.update.backup_wait_minutes', 10))) {
+                    $result = ['ok' => false, 'message' => 'A backup is still running. Try the update again once it has finished.'];
+                    $this->writeGate($run, 'failed', $result['message']);
+
+                    return $result;
+                }
+                $this->writeGate($run, 'dumped', 'Used the backup that just finished.');
+
+                return ['ok' => true, 'skipped' => true, 'message' => 'Used the backup that just finished.'];
+            }
+
+            $this->writeGate($run, 'dumping');
+            $result = $this->runBackup(beforeUpdate: true, onDumped: fn () => $this->writeGate($run, 'dumped', 'Database saved; uploading in the background.'));
+
+            if (! ($result['running'] ?? false)) {
+                $gate = $this->gate($run);
+                if (($result['skipped'] ?? false) && ($result['ok'] ?? false)) {
+                    $this->writeGate($run, 'skipped', $result['message'] ?? 'Not due.');
+                } elseif (($gate['state'] ?? null) !== 'dumped') {
+                    // No snapshot: the update must not migrate.
+                    $this->writeGate($run, 'failed', $result['message'] ?? 'Backup failed.');
+                }
+                // dumped + upload failed: the update goes on; the dump is kept on disk.
+
+                return $result;
+            }
+        }
+
+        $this->writeGate($run, 'failed', 'A backup is already running.');
+
+        return ['ok' => false, 'message' => 'A backup is already running.'];
+    }
+
+    /**
+     * Where the updater's background backup is: dumping | waiting | dumped |
+     * skipped | failed (with message and when it last changed), or null.
+     */
+    public function gate(string $run): ?array
+    {
+        $gate = json_decode((string) @file_get_contents($this->gatePath()), true);
+
+        return is_array($gate) && ($gate['run'] ?? null) === $run ? $gate : null;
+    }
+
+    public function writeGate(string $run, string $state, ?string $message = null): void
+    {
+        $dir = $this->stagingPath();
+        if (! is_dir($dir)) {
+            @mkdir($dir, 0755, true);
+        }
+        @file_put_contents($this->gatePath(), json_encode(['run' => $run, 'state' => $state, 'message' => $message, 'at' => time()]));
+    }
+
+    private function gatePath(): string
+    {
+        return $this->stagingPath() . DIRECTORY_SEPARATOR . 'before-update.json';
     }
 
     private function recordResult(LicenseState $state, array $result): void
@@ -329,6 +418,7 @@ class BackupService
         $retryAttempts = (int) config('subandl.backup.chunk_retry_attempts', 5);
         $fileName = basename($dumpPath);
         $totalChunks = max(1, (int) ceil(filesize($dumpPath) / $chunkSize));
+        $heartbeatAt = time();
         $common = $this->client->identityPayload();
 
         try {
@@ -409,6 +499,12 @@ class BackupService
                 // ~60 MB dump exhausts a 128M memory_limit partway through.
                 unset($chunk, $chunkResponse);
                 gc_collect_cycles();
+
+                // A long upload is not a dead one: keep the running claim fresh.
+                if (time() - $heartbeatAt >= 60) {
+                    $heartbeatAt = time();
+                    LicenseState::query()->where('backup_running', true)->update(['backup_started_at' => now()]);
+                }
             }
         } finally {
             fclose($handle);

@@ -653,10 +653,7 @@ let modalShape = null; // what the update card was last built for, minus the num
 function packageHtml(pkg) {
     const mb = (n) => (n / 1048576).toFixed(1) + ' MB';
     if (pkg.state === 'ready') {
-        return `<p class="sbw-flash sbw-ok" role="status">${icons.check} Downloaded${pkg.total ? ` (${mb(pkg.total)})` : ''} and backed up in the background — installs in moments.</p>`;
-    }
-    if (pkg.state === 'backing-up') {
-        return `<p class="sbw-flash sbw-info" role="status">Package downloaded; taking the backup in the background… You can install now; it waits for the backup.</p>`;
+        return `<p class="sbw-flash sbw-ok" role="status">${icons.check} Already downloaded${pkg.total ? ` (${mb(pkg.total)})` : ''} — installs in moments.</p>`;
     }
     if (pkg.state === 'downloading') {
         const pct = pkg.total ? Math.floor((100 * pkg.received) / pkg.total) : null;
@@ -716,9 +713,9 @@ function renderModal(u, progress = null, error = null) {
             ${ready && news ? `<div class="sbw-box"><span class="sbw-label">What's new</span>${news}</div>` : ''}
             ${ready ? packageHtml(pkg) : ''}
             ${ready ? `<ul class="sbw-assure">
-                <li>${icons.check} ${pkg.state === 'ready' ? 'Backup already taken' : 'A full backup is taken first'}</li>
+                <li>${icons.check} The database is backed up first — in the background</li>
                 <li>${icons.check} Your data and settings stay as they are</li>
-                <li>${icons.check} ${pkg.state === 'ready' ? 'Already downloaded — usually done in seconds' : 'Usually done in about a minute'}</li>
+                <li>${icons.check} Starts right away — usually done in about a minute</li>
             </ul>` : stagesHtml()}
             ${progress ? `<p class="sbw-flash sbw-info" role="status">${esc(progress)}</p>` : ''}
             ${error ? `<p class="sbw-flash sbw-bad" role="alert">${esc(error)}</p>` : ''}
@@ -846,12 +843,7 @@ function autoPrompt() {
     }
 
     const u = state.update;
-    // Asked only once the package is downloaded and the backup taken in the
-    // background, so "Install now" is quick; the Update button works anytime.
-    const preparing = ['downloading', 'backing-up'].includes(u?.package?.state);
-    // Look again every minute (instead of every 5) until it is ready to ask.
-    if (preparing && document.visibilityState === 'visible') refresh(true);
-    if (u?.available && !u.running && !preparing && !unlicensed() && modal.hidden && payModal.hidden
+    if (u?.available && !u.running && !unlicensed() && modal.hidden && payModal.hidden
         && modalDismissedFor !== u.latest_version
         && (u.force_update || !snoozed(UPDATE_SNOOZE_KEY + u.latest_version))) {
         showModal();

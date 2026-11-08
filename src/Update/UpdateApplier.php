@@ -268,20 +268,23 @@ class UpdateApplier
                         return ['ok' => false, 'message' => 'No download URL provided by update server.'];
                     }
 
-                    // Not forced — only actually backs up when one is due (or none ever ran).
-                    $backup = $this->preUpdateBackup($job, $deadline);
-                    if ($backup === null) {
-                        return null;
-                    }
-                    if (! ($backup['ok'] ?? false)) {
-                        UpdateProgress::fail('backup', $backup['message'] ?? 'Backup failed.');
+                    // The backup runs in the background (dump, then upload) while the
+                    // package downloads and merges; only the migrations wait, and only
+                    // for the dump. Not forced — it backs up when one is due, as before.
+                    $job['backup'] ??= $this->startBackgroundBackup($job['run']) ? 'background' : 'inline';
 
-                        return ['ok' => false, 'message' => 'Aborting update: pre-update backup failed. ' . ($backup['message'] ?? '')];
+                    if ($job['backup'] === 'background') {
+                        UpdateProgress::stage('backup', 5, 'Saving the database in the background…');
+                    } else {
+                        $backup = $this->preUpdateBackup($job, $deadline);
+                        if ($backup === null) {
+                            return null;
+                        }
+                        $failed = $this->recordInlineBackup($job, $backup);
+                        if ($failed) {
+                            return $failed;
+                        }
                     }
-                    $job['backup_id'] = $backup['backup_id'] ?? null;
-                    ($backup['skipped'] ?? false)
-                        ? UpdateProgress::skip('backup', $backup['message'] ?? 'Not due.')
-                        : UpdateProgress::done('backup', 'Backup uploaded.');
 
                     if (! class_exists(ZipArchive::class)) {
                         UpdateProgress::fail('download', 'The PHP zip extension is not enabled.');
@@ -336,6 +339,28 @@ class UpdateApplier
                     break;
 
                 case 'migrate':
+                    // The database must be saved before it changes.
+                    if (($job['backup'] ?? null) === 'background') {
+                        $gate = $this->awaitBackgroundBackup($job['run'], $deadline);
+                        if ($gate === null) {
+                            return null;
+                        }
+                        if ($gate['fallback'] ?? false) {
+                            // The background process never got going: back up right here.
+                            $job['backup'] = 'inline';
+                            $backup = $this->preUpdateBackup($job, $deadline);
+                            if ($backup === null) {
+                                return null;
+                            }
+                            if ($failed = $this->recordInlineBackup($job, $backup)) {
+                                return $failed;
+                            }
+                        } elseif (! $gate['ok']) {
+                            return ['ok' => false, 'extracted' => true, 'message' => $gate['message'], 'backup_path' => null];
+                        }
+                        $job['backup'] = 'done';
+                    }
+
                     if ($chunked && $worked) {
                         return null;
                     }
@@ -469,6 +494,85 @@ class UpdateApplier
         event(new UpdateFinished($ok, $fromVersion, $toVersion, $result));
 
         return $result;
+    }
+
+    /**
+     * Starts the pre-update backup as a detached process (see
+     * BackupService::runBeforeUpdate()); false when that is switched off or
+     * no process can be spawned — the backup then runs inline as before.
+     */
+    private function startBackgroundBackup(string $run): bool
+    {
+        if (! config('subandl.update.background_backup', true)) {
+            return false;
+        }
+
+        $this->backupService->writeGate($run, 'starting');
+
+        return BackgroundArtisan::dispatch('subandl:backup', ['--before-update=' . $run]);
+    }
+
+    /**
+     * Waits (within the chunk's budget) until the background backup has saved
+     * the database. Its upload is not waited for.
+     *
+     * @return array{ok: bool, message?: string, fallback?: bool}|null null while still saving
+     */
+    private function awaitBackgroundBackup(string $run, float $deadline): ?array
+    {
+        while (true) {
+            $gate = $this->backupService->gate($run) ?? ['state' => 'starting', 'at' => 0];
+            $state = (string) ($gate['state'] ?? 'starting');
+            $age = time() - (int) ($gate['at'] ?? 0);
+
+            if ($state === 'dumped') {
+                UpdateProgress::done('backup', $gate['message'] ?? 'Database saved; uploading in the background.');
+
+                return ['ok' => true];
+            }
+            if ($state === 'skipped') {
+                UpdateProgress::skip('backup', $gate['message'] ?? 'Not due.');
+
+                return ['ok' => true];
+            }
+            if ($state === 'failed') {
+                UpdateProgress::fail('backup', $gate['message'] ?? 'Backup failed.');
+
+                return ['ok' => false, 'message' => 'Update files applied, but the migrations were not run: the pre-update backup failed. ' . ($gate['message'] ?? '')];
+            }
+
+            // Never picked up (no usable PHP CLI), or its process died before
+            // claiming the backup: do it in this request instead.
+            if (($state === 'starting' && $age > 60) || (in_array($state, ['dumping', 'waiting'], true) && $age > 60 && ! $this->backupService->isRunning())) {
+                return ['ok' => false, 'fallback' => true];
+            }
+
+            UpdateProgress::stage('backup', 50, $state === 'waiting'
+                ? ($gate['message'] ?? 'Waiting for the backup already running…')
+                : 'Saving the database in the background… migrations start right after.');
+
+            if (microtime(true) >= $deadline) {
+                return null;
+            }
+            usleep(500000);
+        }
+    }
+
+    /** Reports an inline backup's outcome; the update's failure result when it failed. */
+    private function recordInlineBackup(array &$job, array $backup): ?array
+    {
+        if (! ($backup['ok'] ?? false)) {
+            UpdateProgress::fail('backup', $backup['message'] ?? 'Backup failed.');
+
+            return ['ok' => false, 'message' => 'Aborting update: pre-update backup failed. ' . ($backup['message'] ?? '')];
+        }
+
+        $job['backup_id'] = $backup['backup_id'] ?? null;
+        ($backup['skipped'] ?? false)
+            ? UpdateProgress::skip('backup', $backup['message'] ?? 'Not due.')
+            : UpdateProgress::done('backup', 'Backup uploaded.');
+
+        return null;
     }
 
     /**
@@ -801,7 +905,8 @@ class UpdateApplier
 
     /**
      * Starts downloading the package of a version the provider just announced,
-     * in a detached process, so "Update now" later only has to install it.
+     * in a detached process (update.prefetch, off by default), so the update's
+     * download stage is instant.
      * Called after every update check; does nothing when the package is
      * already here or on its way, while an update runs, or for a locked
      * version. Never throws: a check must not fail over this.
@@ -809,11 +914,11 @@ class UpdateApplier
     public function schedulePrefetch(array $check): void
     {
         try {
-            if (! config('subandl.update.prefetch', true)
+            if (! config('subandl.update.prefetch', false)
                 || ! ($check['ok'] ?? false) || ! ($check['update_available'] ?? false)
                 || ($check['locked'] ?? false) || empty($check['download_url'])
                 || ! LicenseState::current()->updatesIncluded()
-                || $this->activeJob() || $this->prefetchRunning() || $this->backupService->isRunning()
+                || $this->activeJob() || $this->prefetchRunning()
                 || $this->packageStatus((string) ($check['latest_version'] ?? ''))['state'] === 'ready') {
                 return;
             }
@@ -839,17 +944,10 @@ class UpdateApplier
     }
 
     /**
-     * The background preparation of the next version (subandl:update-prefetch):
-     *
-     *  1. download — resumes a partial download, verifies the checksum and
-     *     records the package as ready;
-     *  2. backup — the same pre-update backup the update itself runs (only
-     *     uploaded when one is due), so when the customer clicks Install the
-     *     backup stage finds it "not due" and passes at once. Should one be
-     *     due again by then, the update simply takes a fresh one.
-     *
-     * Only once both are done is the version reported 'ready' (and the
-     * widget asks the customer to install it). Progress goes to prefetch.json.
+     * The background download of the next version's package
+     * (subandl:update-prefetch, when update.prefetch is on): resumes a partial
+     * download, verifies the checksum and records the package as ready, so
+     * the update's download stage is instant. Progress goes to prefetch.json.
      *
      * @param array|null $check  the provider's update answer; null: the one schedulePrefetch() saved
      */
@@ -872,27 +970,12 @@ class UpdateApplier
         if (! ($download['ok'] ?? false) || ($download['skipped'] ?? false)) {
             return $download;
         }
+
         $size = (int) $download['size'];
+        $this->writePrefetchStatus($version, 'ready', $size, $size);
+        ActivityLog::record('update', true, "v{$version} downloaded in the background (" . self::bytes($size) . '); ready to install.');
 
-        // 2. The backup, now that the package is here (closest to the install).
-        $this->writePrefetchStatus($version, 'backing-up', $size, $size);
-        try {
-            $backup = $this->backupService->runBackup();
-        } catch (\Throwable $e) {
-            $backup = ['ok' => false, 'message' => $e->getMessage()];
-        }
-
-        if (($backup['running'] ?? false) && $this->backupService->waitUntilIdle(60 * (int) config('subandl.update.backup_wait_minutes', 10))) {
-            $backup = ['ok' => true, 'message' => 'Used the backup that was already running.'];
-        }
-
-        $backupNote = ($backup['ok'] ?? false)
-            ? (($backup['skipped'] ?? false) ? 'backup not due (' . ($backup['message'] ?? 'skipped') . ')' : 'backup uploaded')
-            : 'backup failed: ' . ($backup['message'] ?? 'unknown error') . ' — it is retried during the update';
-        $this->writePrefetchStatus($version, 'ready', $size, $size, ($backup['ok'] ?? false) ? null : $backupNote);
-        ActivityLog::record('update', true, "v{$version} prepared in the background: package downloaded (" . self::bytes($size) . "), {$backupNote}. Ready to install.");
-
-        return ['ok' => true, 'message' => "v{$version} is ready to install ({$backupNote})."];
+        return ['ok' => true, 'message' => "v{$version} downloaded and ready to install."];
     }
 
     /**
@@ -950,9 +1033,9 @@ class UpdateApplier
     }
 
     /**
-     * What the widget shows about the next version's background preparation:
-     * downloading → backing-up → ready (failed: the download did not work and
-     * happens during the update instead; null: nothing prepared).
+     * What the widget shows about the next version's package: downloading →
+     * ready (failed: the background download did not work and happens during
+     * the update instead; null: not downloaded ahead).
      *
      * @return array{state: ?string, received: int, total: int, message: ?string}
      */
@@ -973,13 +1056,8 @@ class UpdateApplier
                 continue;
             }
 
-            // The package is here; while the background backup still runs it is not ready yet.
-            // (The first seconds count too: the backup may not have claimed its flag yet.)
-            $backingUp = ($saved['state'] ?? null) === 'backing-up'
-                && ($this->backupService->isRunning() || (int) ($saved['at'] ?? 0) > time() - 30);
-
             return [
-                'state' => $backingUp ? 'backing-up' : 'ready',
+                'state' => 'ready',
                 'received' => $meta['size'],
                 'total' => $meta['size'],
                 'message' => $saved['message'] ?? null,
