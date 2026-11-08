@@ -843,6 +843,9 @@ function autoPrompt() {
     }
 
     const u = state.update;
+    // "Updating…" on screen while this page is not the one updating: look again
+    // every minute, so the Update button is back as soon as the server clears it.
+    if (u?.running && busy !== 'update' && document.visibilityState === 'visible') refresh(true);
     if (u?.available && !u.running && !unlicensed() && modal.hidden && payModal.hidden
         && modalDismissedFor !== u.latest_version
         && (u.force_update || !snoozed(UPDATE_SNOOZE_KEY + u.latest_version))) {

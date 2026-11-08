@@ -169,20 +169,21 @@ class UpdateApplier
         ]);
     }
 
-    /** No request (chunk, CLI, scheduler) is working on an update right now. */
+    /**
+     * No process (chunk, CLI, scheduler) is working on the update job right
+     * now. A file lock, not the cache lock: a process killed mid-chunk (FPM
+     * timeout, server restart) releases it at once, where a cache lock would
+     * stay "held" for its whole TTL.
+     */
     private function updateLockFree(): bool
     {
-        try {
-            $lock = \Illuminate\Support\Facades\Cache::lock(\SUBandL\SUBandL::UPDATE_LOCK, 10);
-            if (! $lock->get()) {
-                return false;
-            }
-            $lock->release();
-
-            return true;
-        } catch (\Throwable $e) {
+        $lock = $this->fileLock('update.lock');
+        if ($lock === null) {
             return false;
         }
+        $this->releaseLock($lock);
+
+        return true;
     }
 
     /** Whether $run is the job in progress (the browser's next chunk). */
@@ -217,6 +218,22 @@ class UpdateApplier
             return ['finished' => true, 'result' => ['ok' => false, 'message' => 'This update is no longer in progress. Start it again.']];
         }
 
+        // Held while this process works on the job; the OS drops it the moment
+        // the process dies, so a killed request never looks "busy" for long.
+        $working = $this->fileLock('update.lock');
+        if ($working === null) {
+            return ['finished' => false]; // another request is on this job right now
+        }
+
+        try {
+            return $this->stepLocked($run, $job, $budgetSeconds);
+        } finally {
+            $this->releaseLock($working);
+        }
+    }
+
+    private function stepLocked(string $run, array $job, ?float $budgetSeconds): array
+    {
         UpdateProgress::resume($run);
         // Heartbeat: a chunked update outlasting stale_minutes is still alive.
         LicenseState::current()->forceFill(['update_running' => true, 'update_started_at' => now()])->save();
@@ -1215,12 +1232,18 @@ class UpdateApplier
     /** The download lock (flock, so it is released even when the process dies); null when taken. */
     private function downloadLock()
     {
+        return $this->fileLock('download.lock');
+    }
+
+    /** An flock on staging/$name, released by the OS if the process dies; null when taken. */
+    private function fileLock(string $name)
+    {
         $dir = $this->stagingDir();
         if (! is_dir($dir) && ! @mkdir($dir, 0755, true) && ! is_dir($dir)) {
             return null;
         }
 
-        $handle = @fopen($dir . DIRECTORY_SEPARATOR . 'download.lock', 'c');
+        $handle = @fopen($dir . DIRECTORY_SEPARATOR . $name, 'c');
         if ($handle === false) {
             return null;
         }
