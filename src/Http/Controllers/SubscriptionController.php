@@ -448,7 +448,17 @@ class SubscriptionController extends Controller
     /** One chunk of the job; the finished step's answer once it is done. */
     private function updateChunk(string $run, LicenseClient $client, UpdateApplier $applier)
     {
-        $step = $applier->step($run, (float) config('subandl.update.chunk_seconds', 10));
+        // Only a client that says it speaks chunks gets `continue: true`. A page
+        // still running an older subandl.js — typically the very page that just
+        // installed this version and goes on to the next step — reads any
+        // `status: true` as "step done" and would leave the job half applied
+        // (stuck on "Updating…"); it gets the whole step in this request instead.
+        $budget = request()->boolean('chunked') ? (float) config('subandl.update.chunk_seconds', 10) : null;
+        if ($budget === null) {
+            Platform::allowLongRunning();
+        }
+
+        $step = $applier->step($run, $budget);
 
         if (! $step['finished']) {
             return response()->json(['status' => true, 'continue' => true, 'progress' => UpdateProgress::current()]);

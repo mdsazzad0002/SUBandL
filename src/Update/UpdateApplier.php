@@ -80,6 +80,23 @@ class UpdateApplier
             return false;
         }
 
+        // A job nobody drives any more (the tab was closed, or the page reloaded
+        // mid-update): no chunk for JOB_IDLE_SECONDS and no request holding the
+        // update lock. Clear the flag so the Update button is back — clicking it
+        // carries on safely (finished files compare equal, migrations resume).
+        $job = $this->loadJob();
+        if ($job !== null && (int) ($job['touched_at'] ?? 0) < time() - self::JOB_IDLE_SECONDS && $this->updateLockFree()) {
+            LicenseState::query()->whereKey($state->getKey())->where('update_running', true)->update([
+                'update_running' => false,
+                'last_update_status' => 'failed',
+                'last_update_message' => 'The update stopped before it finished (the page was closed or reloaded). Click Update to carry on.',
+            ]);
+            $state->forceFill(['update_running' => false])->save();
+            $this->clearJob();
+
+            return false;
+        }
+
         $staleMinutes = (int) config('subandl.stale_minutes', 30);
         if ($state->update_started_at && $state->update_started_at->lt(now()->subMinutes($staleMinutes))) {
             $recovered = LicenseState::query()
@@ -150,6 +167,22 @@ class UpdateApplier
             'from_version' => (string) config('subandl.version', '1.0.0'),
             'touched_at' => time(),
         ]);
+    }
+
+    /** No request (chunk, CLI, scheduler) is working on an update right now. */
+    private function updateLockFree(): bool
+    {
+        try {
+            $lock = \Illuminate\Support\Facades\Cache::lock(\SUBandL\SUBandL::UPDATE_LOCK, 10);
+            if (! $lock->get()) {
+                return false;
+            }
+            $lock->release();
+
+            return true;
+        } catch (\Throwable $e) {
+            return false;
+        }
     }
 
     /** Whether $run is the job in progress (the browser's next chunk). */

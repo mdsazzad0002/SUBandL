@@ -196,7 +196,7 @@ export function createSubandl({ base = '' } = {}) {
                 let r;
                 let retries = 0;
                 for (;;) {
-                    r = await request('POST', '/license/update/run', { run });
+                    r = await request('POST', '/license/update/run', { run, chunked: 1 });
                     if (r.data && r.data.progress && r.data.progress.run === run) tick(r.data.progress);
                     if (r.ok && r.data.continue) {
                         retries = 0;
