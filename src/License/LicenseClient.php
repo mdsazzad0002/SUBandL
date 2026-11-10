@@ -8,6 +8,7 @@ use SUBandL\Models\ActivityLog;
 use SUBandL\Models\LicenseState;
 use SUBandL\Support\DeviceSerial;
 use SUBandL\Support\HttpClient;
+use SUBandL\Support\NoticeStore;
 
 /**
  * Talks to the provider's licensing API. Endpoints and payload/response shapes
@@ -44,6 +45,9 @@ class LicenseClient
                 'message' => 'License server gave no license answer (HTTP ' . $response->status() . ').',
             ];
         }
+
+        // Notices come with every answer (also a blocked one), see NoticeStore.
+        NoticeStore::recordFrom($json);
 
         $licenseValid = (bool) ($json['license_valid'] ?? false);
         $apiStatus = $json['status'] ?? 'invalid_license';
@@ -90,6 +94,8 @@ class LicenseClient
         if ($json === [] && ! $response->successful()) {
             return ['ok' => false, 'message' => 'Update server returned an error (HTTP ' . $response->status() . ').'];
         }
+
+        NoticeStore::recordFrom($json);
 
         $latestVersion = $json['latest_version'] ?? null;
 

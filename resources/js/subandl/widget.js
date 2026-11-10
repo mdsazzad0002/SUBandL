@@ -9,6 +9,8 @@
  *     there (check → backup → download → merge → migrate, each with its own
  *     progress bar and percentage → reload), or — for a lifetime
  *     plan without the update subscription — to show what it would unlock
+ *   • provider notices (sent with every license / update check): a popup
+ *     once per browser for notices marked "popup", and a Notices tab
  *   • payment reminder modal while money is owed: every reminderMinutes once
  *     payment is late (grace period), every dueReminderHours before that;
  *     "Later" only hides the popup — a banner stays until it is paid
@@ -38,6 +40,7 @@ const api = createSubandl({ base: cfg.base || '' });
 const REFRESH_MS = 5 * 60 * 1000;
 const DUE_SNOOZE_KEY = 'subandl:due-snooze-until';
 const UPDATE_SNOOZE_KEY = 'subandl:update-snooze:';
+const NOTICE_READ_KEY = 'subandl:notices-read';
 
 const pageEl = document.getElementById('subandl-page');
 const pageMode = !!pageEl;
@@ -56,6 +59,7 @@ let liveProgress = null; // the server's per-stage snapshot of the version step 
 let liveStepNo = 1; // which version step (multi-version upgrades run one per request)
 let flash = null; // { tone, text }
 let paying = null; // pay_url of the invoice being paid in the popup window
+let noticeShown = null; // key of the notice in the popup
 
 /* ------------------------------------------------------------------ utils */
 
@@ -80,6 +84,32 @@ const store = {
 
 const snoozed = (key) => Number(store.get(key) || 0) > Date.now();
 const snooze = (key, ms) => store.set(key, Date.now() + ms);
+
+// Notice keys (id:revision) this browser has seen. An edited notice gets a new
+// revision, so it counts as unread again.
+function readNotices() {
+    try {
+        const list = JSON.parse(store.get(NOTICE_READ_KEY) || '[]');
+        return Array.isArray(list) ? list : [];
+    } catch (e) {
+        return [];
+    }
+}
+
+function markNoticesRead(keys) {
+    const read = readNotices();
+    const fresh = keys.filter((k) => !read.includes(k));
+    if (!fresh.length) return;
+    store.set(NOTICE_READ_KEY, JSON.stringify([...read, ...fresh].slice(-200)));
+    // Host UIs that list the same notices (a topbar bell) update their count.
+    window.dispatchEvent(new CustomEvent('subandl:notices-read', { detail: { keys: fresh } }));
+}
+
+const notices = () => (Array.isArray(state?.notices) ? state.notices : []);
+const unreadNotices = () => {
+    const read = readNotices();
+    return notices().filter((n) => !read.includes(n.key));
+};
 
 function money(value) {
     const n = Number(value);
@@ -137,15 +167,18 @@ const unlicensedNote = () => (unlicensed() ? '<p class="sbw-note sbw-bad">Availa
 
 const hasLicenseTab = () => !!state && (!!state.access?.license || !!state.payment || !!state.account?.wallet);
 const hasUpdateTab = () => !!state && (!!state.update || !!state.backup);
+const hasNoticeTab = () => notices().length > 0;
 
 function normalizeTab(name) {
-    const wanted = name === 'update' || name === 'backup' ? 'update' : name === 'license' ? 'license' : null;
+    const wanted = name === 'update' || name === 'backup' ? 'update' : name === 'license' || name === 'notices' ? name : null;
     if (wanted === 'license' && hasLicenseTab()) return 'license';
     if (wanted === 'update' && hasUpdateTab()) return 'update';
+    if (wanted === 'notices' && hasNoticeTab()) return 'notices';
     // No preference: whatever needs attention first.
-    if (state?.payment) return 'license';
+    if (state?.payment && hasLicenseTab()) return 'license';
+    if (unreadNotices().length) return 'notices';
     if (hasUpdateTab() && (state.update?.available || state.backup?.overdue)) return 'update';
-    return hasLicenseTab() ? 'license' : 'update';
+    return hasLicenseTab() ? 'license' : hasUpdateTab() ? 'update' : 'notices';
 }
 
 /* -------------------------------------------------------------------- DOM */
@@ -157,6 +190,7 @@ const icons = {
     check: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>',
     shield: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>',
     close: '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>',
+    megaphone: '<svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 11v2a1 1 0 0 0 1 1h2l5 4V6L6 10H4a1 1 0 0 0-1 1z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 5.5a9 9 0 0 1 0 13"/></svg>',
     refresh: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 4v6h-6"/></svg>',
 };
 
@@ -182,6 +216,9 @@ root.innerHTML = `
     <div class="sbw-modal" hidden>
         <div class="sbw-modal-card" role="alertdialog" aria-modal="true" aria-labelledby="sbw-modal-title"></div>
     </div>
+    <div class="sbw-modal sbw-noticemodal" hidden>
+        <div class="sbw-modal-card sbw-noticecard" role="alertdialog" aria-modal="true" aria-labelledby="sbw-notice-title"></div>
+    </div>
     <div class="sbw-modal sbw-paymodal" hidden>
         <div class="sbw-modal-card sbw-paycard" role="alertdialog" aria-modal="true" aria-labelledby="sbw-pay-title"></div>
     </div>
@@ -196,6 +233,8 @@ const modalCard = $('.sbw-modal-card');
 const payModal = $('.sbw-paymodal');
 const payCard = $('.sbw-paycard');
 const banner = $('.sbw-banner');
+const noticeModal = $('.sbw-noticemodal');
+const noticeCard = $('.sbw-noticecard');
 
 /* ---------------------------------------------------------------- render */
 
@@ -483,12 +522,14 @@ function renderTabs() {
     const tabs = [
         hasLicenseTab() && ['license', 'License'],
         hasUpdateTab() && ['update', 'Update & Backup'],
+        hasNoticeTab() && ['notices', 'Notices'],
     ].filter(Boolean);
 
+    const unread = unreadNotices().length;
     tabsNav.hidden = tabs.length < 2;
     tabsNav.innerHTML = tabs.map(([key, label]) => `
         <button type="button" role="tab" class="sbw-tabbtn${tab === key ? ' sbw-active' : ''}" aria-selected="${tab === key}" data-sbw-tab="${key}">
-            ${esc(label)}${key === 'update' && (state.update?.available || state.backup?.overdue) ? '<span class="sbw-pip"></span>' : ''}
+            ${esc(label)}${key === 'update' && (state.update?.available || state.backup?.overdue) ? '<span class="sbw-pip"></span>' : ''}${key === 'notices' && unread ? `<span class="sbw-count">${unread}</span>` : ''}
         </button>`).join('');
 }
 
@@ -498,7 +539,9 @@ function render() {
     const flashHtml = flash ? `<p class="sbw-flash sbw-wide sbw-${flash.tone}" role="status">${esc(flash.text)}</p>` : '';
     let content;
 
-    if (tab === 'license') {
+    if (tab === 'notices') {
+        content = renderNotices();
+    } else if (tab === 'license') {
         content = [
             state.account ? renderAccount(state.account) : '',
             state.payment ? renderPayment(state.payment) : '',
@@ -517,10 +560,68 @@ function render() {
     if (pageMode && state.urls.home) $('.sbw-back').href = state.urls.home;
     body.innerHTML = flashHtml + content;
 
-    const attention = !!state.payment || !!state.update?.available || !!state.backup?.overdue;
+    // What the Notices tab showed now counts as read (it was rendered "New" once).
+    if (tab === 'notices' && panelOpen) markNoticesRead(notices().map((n) => n.key));
+
+    const attention = !!state.payment || !!state.update?.available || !!state.backup?.overdue || unreadNotices().length > 0;
     $('.sbw-dot').hidden = !attention;
     $('.sbw-tab').classList.toggle('sbw-attention', !!state.payment);
     renderBanner();
+}
+
+const NOTICE_HERO = { info: '', success: 'sbw-hero-ok', warning: 'sbw-hero-warn', danger: 'sbw-hero-danger' };
+const NOTICE_KICKER = { info: 'Notice', success: 'Good news', warning: 'Important', danger: 'Urgent' };
+
+// Plain text from the provider: escaped, line breaks kept.
+const noticeBody = (n) => (n.body ? `<p class="sbw-notice-body">${esc(n.body).replace(/\r?\n/g, '<br>')}</p>` : '');
+const noticeLink = (n, cls = 'sbw-btn') => (n.link_url
+    ? `<a class="${cls}" href="${esc(n.link_url)}" target="_blank" rel="noopener noreferrer">${esc(n.link_label || 'Open link')}</a>`
+    : '');
+
+function renderNotices() {
+    const list = notices();
+    if (!list.length) return '<section class="sbw-card sbw-wide"><p class="sbw-muted">No notices right now.</p></section>';
+    const read = readNotices();
+
+    return list.map((n) => `
+        <section class="sbw-card sbw-wide sbw-notice sbw-notice-${esc(n.type)}">
+            <div class="sbw-notice-head">
+                <h3>${esc(n.title)}</h3>
+                ${read.includes(n.key) ? '' : '<span class="sbw-badge sbw-new">New</span>'}
+            </div>
+            ${n.published_at ? `<p class="sbw-muted">${date(n.published_at, true)}${n.ends_at ? ` · until ${date(n.ends_at, true)}` : ''}</p>` : ''}
+            ${noticeBody(n)}
+            ${n.link_url ? `<div class="sbw-actions">${noticeLink(n, 'sbw-btn sbw-btn-sm')}</div>` : ''}
+        </section>`).join('');
+}
+
+function showNoticeModal(n) {
+    noticeShown = n.key;
+    noticeCard.innerHTML = `
+        <div class="sbw-hero ${NOTICE_HERO[n.type] || ''}">
+            <span class="sbw-hero-icon">${icons.megaphone}</span>
+            <div>
+                <p class="sbw-hero-kicker">${esc(NOTICE_KICKER[n.type] || 'Notice')}</p>
+                <h2 id="sbw-notice-title">${esc(n.title)}</h2>
+            </div>
+        </div>
+        <div class="sbw-modal-body">
+            ${noticeBody(n)}
+            <div class="sbw-actions">
+                ${notices().length > 1 ? '<button type="button" class="sbw-btn sbw-ghost" data-sbw="notice-all">All notices</button>' : ''}
+                ${noticeLink(n, 'sbw-btn sbw-ghost')}
+                <button type="button" class="sbw-btn sbw-btn-lg" data-sbw="notice-ok">Got it</button>
+            </div>
+        </div>`;
+    noticeModal.hidden = false;
+}
+
+// Closing the popup marks that notice read, then the next one (if any) follows.
+function hideNoticeModal() {
+    if (noticeShown) markNoticesRead([noticeShown]);
+    noticeShown = null;
+    noticeModal.hidden = true;
+    if (state) render();
 }
 
 // Stays on screen while payment is late, whatever "Later" was pressed —
@@ -837,16 +938,24 @@ function snoozePayment() {
 function autoPrompt() {
     if (!state || root.hidden || busy) return;
 
-    if (state.payment && !panelOpen && payModal.hidden && modal.hidden && !snoozed(DUE_SNOOZE_KEY)) {
+    if (state.payment && !panelOpen && payModal.hidden && modal.hidden && noticeModal.hidden && !snoozed(DUE_SNOOZE_KEY)) {
         showPayModal();
         return;
+    }
+
+    if (!pageMode && !panelOpen && payModal.hidden && modal.hidden && noticeModal.hidden) {
+        const next = unreadNotices().find((n) => n.popup);
+        if (next) {
+            showNoticeModal(next);
+            return;
+        }
     }
 
     const u = state.update;
     // "Updating…" on screen while this page is not the one updating: look again
     // every minute, so the Update button is back as soon as the server clears it.
     if (u?.running && busy !== 'update' && document.visibilityState === 'visible') refresh(true);
-    if (u?.available && !u.running && !unlicensed() && modal.hidden && payModal.hidden
+    if (u?.available && !u.running && !unlicensed() && modal.hidden && payModal.hidden && noticeModal.hidden
         && modalDismissedFor !== u.latest_version
         && (u.force_update || !snoozed(UPDATE_SNOOZE_KEY + u.latest_version))) {
         showModal();
@@ -887,7 +996,7 @@ function redirectIfLicenseUnusable() {
 }
 
 function applyVisibility() {
-    const hasContent = hasLicenseTab() || hasUpdateTab();
+    const hasContent = hasLicenseTab() || hasUpdateTab() || hasNoticeTab();
     root.hidden = !hasContent || isHiddenHere();
     if (root.hidden) {
         root.classList.remove('sbw-open');
@@ -895,6 +1004,8 @@ function applyVisibility() {
         lockScroll(false);
         hideModal();
         payModal.hidden = true;
+        noticeModal.hidden = true;
+        noticeShown = null;
     }
     renderBanner();
 }
@@ -1200,6 +1311,14 @@ root.addEventListener('click', (event) => {
             hideModal();
             openPanel('license');
             break;
+        case 'notice-ok':
+            hideNoticeModal();
+            autoPrompt();
+            break;
+        case 'notice-all':
+            hideNoticeModal();
+            openPanel('notices');
+            break;
         case 'pay-open':
             showPayModal();
             break;
@@ -1278,6 +1397,8 @@ document.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
     if (!payModal.hidden) {
         snoozePayment();
+    } else if (!noticeModal.hidden) {
+        hideNoticeModal();
     } else if (!modal.hidden && !busy && !state?.update?.force_update) {
         modalDismissedFor = state.update.latest_version;
         hideModal();

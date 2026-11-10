@@ -9,6 +9,7 @@ use SUBandL\Models\LicenseState;
 use SUBandL\Support\Access;
 use SUBandL\Support\Assets;
 use SUBandL\Support\MediaCache;
+use SUBandL\Support\NoticeStore;
 use SUBandL\Support\UpdateNotice;
 use SUBandL\Update\UpdateApplier;
 
@@ -61,6 +62,9 @@ class WidgetController extends Controller
             // Set for one browser per ServerHealth window: it checks whether the
             // provider is reachable and reports back (see ServerHealth).
             'health_check_url' => $health->claimBrowserCheck() ? config('subandl.provider_url') : null,
+
+            // Provider notices for every signed-in user (popup once, Notices tab).
+            'notices' => NoticeStore::visible(),
 
             // Only while something is owed or the payment is late — no due, no card.
             'payment' => $this->payment($state),

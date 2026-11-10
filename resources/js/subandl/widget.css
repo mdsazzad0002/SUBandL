@@ -315,3 +315,18 @@ html.sbw-noscroll, html.sbw-noscroll body { overflow: hidden !important; }
 .sbw-paydue { margin: 4px 0 12px; padding: 12px; border: 1px solid var(--sbw-line); border-radius: 12px; background: var(--sbw-soft); }
 .sbw-paydue .sbw-label { margin-bottom: 6px; }
 .sbw-paydue .sbw-muted { margin: 8px 0 0; font-size: 12px; }
+
+/* Provider notices: Notices tab, popup and the unread count on the tab button. */
+.sbw-hero-ok { background: linear-gradient(135deg, #15803d 0%, #0d9488 100%); }
+.sbw-count {
+    display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 18px; padding: 0 5px;
+    border-radius: 9px; background: var(--sbw-bad); color: #fff; font-size: 11px; font-weight: 700; line-height: 1;
+}
+.sbw-notice { border-left: 4px solid var(--sbw-info); }
+.sbw-notice-success { border-left-color: var(--sbw-ok); }
+.sbw-notice-warning { border-left-color: var(--sbw-warn); }
+.sbw-notice-danger { border-left-color: var(--sbw-bad); }
+.sbw-notice-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.sbw-notice-head h3 { margin: 0; }
+.sbw-notice-body { margin: 8px 0 0; white-space: normal; overflow-wrap: anywhere; }
+.sbw-modal-body > .sbw-notice-body { margin: 0 0 14px; }

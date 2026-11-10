@@ -134,6 +134,12 @@ The License tab follows the `license` access ability (the payment reminder is sh
 
 The widget also sends a tab that was left open to the subscription page once the stored license becomes unusable, so the host application needs no polling of its own.
 
+### Notices from the provider
+
+Notices written on the portal (Admin › Products › Notices) reach the software with no extra request: the provider adds the current list as `notices` to every `/api/verify-license` and `/api/check-update` answer, and `NoticeStore` keeps it (each answer replaces the list, so a notice removed on the portal disappears with the next check). A notice can go to every software, to one software or to one license, with an optional start and end time.
+
+The widget shows them to every signed-in user: a **Notices** tab with an unread count, and, for notices marked *popup*, a popup once per browser ("Got it" marks it read; an edited notice shows again). The payment reminder comes first; the update modal waits until the notice is closed. A notice is plain text (line breaks kept) with an optional `http(s)` button link. New notices arrive within `update_check_hours` (2) while the license is valid. Open the tab from your own UI with `data-subandl-open="notices"` or `SUBandLWidget.open('notices')`.
+
 ### Page loads never contact the provider
 
 Every page, the widget's `/subandl/widget` snapshot and the middlewares read only the stored state. License, update and backup checks run as detached background processes (`RunScheduledTasks` or the scheduler), each throttled on its own. A provider that is slow or down therefore never delays a page, and a failed check never overwrites the last good license state. The only calls from the browser to the provider are the reachability ping, which one browser makes at most once every 30 minutes, and actions a user starts explicitly (Save License, Refresh, Check for update, Update now, Backup now).
