@@ -76,11 +76,17 @@ function csrfHeaders() {
 export function createSubandl({ base = '' } = {}) {
     const root = String(base).replace(/\/+$/, '');
 
-    async function request(method, path, body) {
+    // A request on a bad connection can hang with no answer at all; give up after
+    // `timeout` ms so callers can retry instead of waiting forever (status 0).
+    // Reads get 30s, actions 2 min (they may call the provider); 0 = no limit.
+    async function request(method, path, body, { timeout = method === 'GET' ? 30000 : 120000 } = {}) {
         let res;
+        const ctrl = timeout > 0 && typeof AbortController !== 'undefined' ? new AbortController() : null;
+        const timer = ctrl ? setTimeout(() => ctrl.abort(), timeout) : null;
         try {
             res = await fetch(root + path, {
                 method,
+                signal: ctrl ? ctrl.signal : undefined,
                 credentials: 'same-origin',
                 headers: {
                     Accept: 'application/json',
@@ -91,14 +97,18 @@ export function createSubandl({ base = '' } = {}) {
                 body: body === undefined ? undefined : JSON.stringify(body),
             });
         } catch (e) {
-            return { ok: false, status: 0, data: { message: 'Network error: ' + e.message } };
+            clearTimeout(timer);
+            const timedOut = e && e.name === 'AbortError';
+            return { ok: false, status: 0, data: { message: timedOut ? 'The connection is too slow — no answer from the server.' : 'Network error: ' + e.message } };
         }
 
         let data = {};
         try {
             data = await res.json();
         } catch (e) {
-            // Non-JSON (e.g. a proxy error page).
+            // Non-JSON (e.g. a proxy error page), or the body was cut off by the timeout.
+        } finally {
+            clearTimeout(timer);
         }
 
         return { ok: res.ok, status: res.status, data };
@@ -125,17 +135,15 @@ export function createSubandl({ base = '' } = {}) {
         (async () => {
             let slow = 0;
             while (!stopped) {
-                await sleep(700);
+                // Slow answers (a slow line, or a server that takes one request at a
+                // time like `php artisan serve` on Windows) back the polling off to
+                // every 5s instead of stopping it, so the bars keep moving either way.
+                await sleep(slow >= 2 ? 5000 : 700);
                 if (stopped) break;
                 const started = Date.now();
-                const r = await request('GET', '/license/update/status');
+                const r = await request('GET', '/license/update/status', undefined, { timeout: 20000 });
                 if (!stopped && r.ok && r.data.progress && r.data.progress.run === run) onTick(r.data.progress);
-                // A poll that only gets answered after a whole chunk means the server
-                // takes one request at a time (`php artisan serve` on Windows): each
-                // poll would then cost the update a full request. Stop — every chunk
-                // response carries the progress anyway.
-                slow = Date.now() - started > 2500 ? slow + 1 : 0;
-                if (slow >= 2) break;
+                slow = Date.now() - started > 2500 || !r.ok ? slow + 1 : 0;
             }
         })();
         return () => {
@@ -196,7 +204,8 @@ export function createSubandl({ base = '' } = {}) {
                 let r;
                 let retries = 0;
                 for (;;) {
-                    r = await request('POST', '/license/update/run', { run, chunked: 1 });
+                    // Chunks are short on the server; the long timeout only covers a slow line.
+                    r = await request('POST', '/license/update/run', { run, chunked: 1 }, { timeout: 180000 });
                     if (r.data && r.data.progress && r.data.progress.run === run) tick(r.data.progress);
                     if (r.ok && r.data.continue) {
                         retries = 0;
@@ -261,7 +270,8 @@ export function createSubandl({ base = '' } = {}) {
 
         /** @returns {Promise<{ ok: boolean, message: string }>} */
         async runBackup(onProgress = () => {}) {
-            const r = await request('POST', '/license/backup/run');
+            // A backup may run inside this request on small servers: never cut it off.
+            const r = await request('POST', '/license/backup/run', undefined, { timeout: 0 });
 
             if (!r.ok) {
                 return { ok: false, message: r.data.message || 'Backup failed.' };

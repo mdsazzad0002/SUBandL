@@ -558,7 +558,7 @@ function render() {
 
     renderTabs();
     if (pageMode && state.urls.home) $('.sbw-back').href = state.urls.home;
-    body.innerHTML = flashHtml + content;
+    swapHtml(body, flashHtml + content);
 
     // What the Notices tab showed now counts as read (it was rendered "New" once).
     if (tab === 'notices' && panelOpen) markNoticesRead(notices().map((n) => n.key));
@@ -749,6 +749,65 @@ function patchStages() {
 
 let modalShape = null; // what the update card was last built for, minus the numbers
 
+// Rebuilding a container with innerHTML drops keyboard focus to <body> and resets
+// its scroll, so the modal looked like it "refreshed" and stole focus on every
+// rebuild. Swap the markup, then put focus and scroll back where they were.
+function swapHtml(el, html) {
+    if (el.innerHTML === html) return;
+    const active = document.activeElement;
+    const focusKey = el.contains(active) ? active.dataset?.sbw || active.name || active.id || null : null;
+    const scrollers = [el, el.parentElement].filter(Boolean).map((node) => [node, node.scrollTop]);
+    el.innerHTML = html;
+    scrollers.forEach(([node, top]) => (node.scrollTop = top));
+    if (focusKey) {
+        const again = el.querySelector(`[data-sbw="${CSS.escape(focusKey)}"], [name="${CSS.escape(focusKey)}"], #${CSS.escape(focusKey)}`);
+        if (again && !again.disabled) again.focus({ preventScroll: true });
+    }
+}
+
+const STAGE_RANK = { pending: 0, running: 1, done: 2, skipped: 2, failed: 2 };
+const STAGE_ORDER = ['check', 'backup', 'download', 'merge', 'migrate'];
+
+// Polls and chunk responses race on a slow line: an older snapshot can land after a
+// newer one and drag the bars backwards. Within one step only ever move forward.
+function mergeProgress(prev, next) {
+    if (!next) return prev;
+    if (!prev || !prev.stages || (prev.run && next.run && prev.run !== next.run)) return next;
+    const stages = { ...(next.stages || {}) };
+    for (const [key, old] of Object.entries(prev.stages)) {
+        const cur = stages[key];
+        if (!cur) {
+            stages[key] = old;
+            continue;
+        }
+        const oldRank = STAGE_RANK[old.status] ?? 0;
+        const curRank = STAGE_RANK[cur.status] ?? 0;
+        if (curRank < oldRank) stages[key] = old;
+        else if (curRank === oldRank && (cur.percent || 0) < (old.percent || 0)) stages[key] = { ...cur, percent: old.percent };
+    }
+    const order = (key) => STAGE_ORDER.indexOf(key);
+    const current = order(next.current) >= order(prev.current) ? next.current : prev.current;
+    return { ...next, current, stages };
+}
+
+// The status lines under the bars (info / error / background download) change far
+// more often than the card's layout: update their text in place.
+function patchModalLines(progress, error, pkg) {
+    const set = (sel, text) => {
+        const el = modalCard.querySelector(sel);
+        if (!el) return;
+        if (el.textContent !== (text || '')) el.textContent = text || '';
+        el.hidden = !text;
+    };
+    set('[data-sbw-line="info"]', progress);
+    set('[data-sbw-line="error"]', error);
+    const pkgEl = modalCard.querySelector('[data-sbw-line="pkg"]');
+    if (pkgEl) {
+        const html = packageHtml(pkg || {});
+        if (pkgEl.innerHTML !== html) pkgEl.innerHTML = html;
+    }
+}
+
 // The package is fetched in the background as soon as a new version is found,
 // so the click only has to confirm and install it.
 function packageHtml(pkg) {
@@ -794,14 +853,15 @@ function renderModal(u, progress = null, error = null) {
 
     // Same card, new numbers: patch in place instead of rebuilding.
     const pkg = u.package || {};
-    const shape = JSON.stringify([u.latest_version, state.version, updateStep, busy, progress, error, ready, pkg.state, ready && pkg.state === 'downloading' ? pkg.received : 0]);
-    if (shape === modalShape && modalCard.querySelector('.sbw-stages')) {
-        patchStages();
+    const shape = JSON.stringify([u.latest_version, state.version, updateStep, busy, !!error, ready, pkg.state, !!(ready && news)]);
+    if (shape === modalShape && modalCard.firstElementChild) {
+        if (modalCard.querySelector('.sbw-stages')) patchStages();
+        patchModalLines(progress, error, pkg);
         return;
     }
     modalShape = shape;
 
-    modalCard.innerHTML = `
+    swapHtml(modalCard, `
         <div class="sbw-hero">
             <span class="sbw-hero-icon">${icons.gift}</span>
             <div>
@@ -812,19 +872,19 @@ function renderModal(u, progress = null, error = null) {
         </div>
         <div class="sbw-modal-body">
             ${ready && news ? `<div class="sbw-box"><span class="sbw-label">What's new</span>${news}</div>` : ''}
-            ${ready ? packageHtml(pkg) : ''}
+            ${ready ? `<div data-sbw-line="pkg">${packageHtml(pkg)}</div>` : ''}
             ${ready ? `<ul class="sbw-assure">
                 <li>${icons.check} The database is backed up first — in the background</li>
                 <li>${icons.check} Your data and settings stay as they are</li>
                 <li>${icons.check} Starts right away — usually done in about a minute</li>
             </ul>` : stagesHtml()}
-            ${progress ? `<p class="sbw-flash sbw-info" role="status">${esc(progress)}</p>` : ''}
-            ${error ? `<p class="sbw-flash sbw-bad" role="alert">${esc(error)}</p>` : ''}
+            <p class="sbw-flash sbw-info" role="status" data-sbw-line="info"${progress ? '' : ' hidden'}>${esc(progress || '')}</p>
+            <p class="sbw-flash sbw-bad" role="alert" data-sbw-line="error"${error ? '' : ' hidden'}>${esc(error || '')}</p>
             <div class="sbw-actions">
                 ${u.force_update || busy ? '' : `<button type="button" class="sbw-btn sbw-ghost" data-sbw="update-later">${error ? 'Close' : 'Later'}</button>`}
                 ${updateStep === 'done' ? '' : `<button type="button" class="sbw-btn sbw-btn-lg" data-sbw="update-run" ${actionOff()}>${busy === 'update' ? 'Updating…' : error ? 'Try again' : pkg.state === 'ready' ? 'Install now' : 'Update now'}</button>`}
             </div>
-        </div>`;
+        </div>`);
 }
 
 function renderPayModal(p) {
@@ -1032,14 +1092,20 @@ async function runUpdate() {
 
     // 2. Backup, download, merge and migrate, one version step at a time;
     //    every stage reports its own percentage while the step runs.
+    let note = null;
     const result = await api.runUpdate(({ message, step, progress, version, more }) => {
         if (step && step !== liveStepNo) liveProgress = null;
         liveStepNo = step || liveStepNo;
-        if (progress) liveProgress = progress;
-        renderModal(state.update, version && more ? `${message} Continuing with the next version…` : null);
+        if (progress) liveProgress = mergeProgress(liveProgress, progress);
+        // Keep "Connection lost, retrying…" / "Waiting…" on screen until real progress
+        // arrives again, so a slow line doesn't look frozen.
+        if (version && more) note = `${message} Continuing with the next version…`;
+        else if (!progress && message) note = message;
+        else if (progress && note && !version) note = null;
+        renderModal(state.update, note);
     });
     busy = null;
-    if (result.progress) liveProgress = result.progress;
+    if (result.progress) liveProgress = mergeProgress(liveProgress, result.progress);
 
     if (result.ok) {
         updateStep = 'done';
