@@ -161,6 +161,9 @@ export function createSubandl({ base = '' } = {}) {
 
         status: () => request('GET', '/license/status'),
 
+        /** { running, progress: { run, stages… } | null, version, last_update_status } */
+        updateStatus: () => request('GET', '/license/update/status', undefined, { timeout: 20000 }),
+
         async saveLicense(license) {
             const r = await request('POST', '/license/save', { license });
             return { ok: r.ok, message: r.data.message || (r.ok ? 'License saved.' : 'Could not verify the license.') };
@@ -184,9 +187,14 @@ export function createSubandl({ base = '' } = {}) {
          * onProgress receives { message, step, progress } while a step runs —
          * progress is the server's per-stage snapshot (see updateStages()) —
          * and { message, version, step, progress } after each step.
+         *
+         * options.resumeRun: carry on the job of an earlier run (the page was
+         * reloaded mid-update) — the server continues it where it stopped.
+         * options.onRun(run): called with each step's run id, so the page can
+         * remember it and resume after a reload.
          * @returns {Promise<{ ok: boolean, message: string, version?: string, progress?: object }>}
          */
-        async runUpdate(onProgress = () => {}) {
+        async runUpdate(onProgress = () => {}, { resumeRun = null, onRun = () => {} } = {}) {
             let last = { ok: true, message: 'No update available.' };
 
             for (let step = 0; step < 20; step++) {
@@ -194,7 +202,8 @@ export function createSubandl({ base = '' } = {}) {
                 onProgress({ message: 'Updating… do not close this page.', step: step + 1, progress: null });
 
                 // Tags this step's snapshot, so a poll never shows the last step's.
-                const run = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+                const run = (step === 0 && resumeRun) || Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+                onRun(run);
                 const stop = watchProgress(run, tick);
 
                 // The server works in short chunks (continue: true) so no request

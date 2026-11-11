@@ -126,8 +126,33 @@ class LicenseClient
             'monthly_fee' => $json['monthly_fee'] ?? null,
             'commands' => $json['commands'] ?? [],
             'message' => $json['message'] ?? null,
+            // Every newer version, oldest first (providers that send
+            // pending_versions): their packages are all downloaded ahead.
+            'pending' => $locked ? [] : self::pendingVersions($json['pending_versions'] ?? [], $currentVersion),
             'raw' => $json,
         ];
+    }
+
+    /** @return list<array{latest_version: string, download_url: string, checksum: ?string, size: ?int, version_title: ?string}> */
+    private static function pendingVersions(mixed $list, string $currentVersion): array
+    {
+        $pending = [];
+        foreach (is_array($list) ? $list : [] as $item) {
+            $version = is_array($item) ? (string) ($item['version'] ?? '') : '';
+            if ($version === '' || empty($item['download_url']) || ! version_compare($version, $currentVersion, '>')) {
+                continue;
+            }
+            $pending[] = [
+                'latest_version' => $version,
+                'download_url' => (string) $item['download_url'],
+                'checksum' => $item['checksum'] ?? $item['sha256'] ?? null,
+                'size' => isset($item['size']) ? (int) $item['size'] : null,
+                'version_title' => $item['title'] ?? null,
+            ];
+        }
+        usort($pending, fn ($a, $b) => version_compare($a['latest_version'], $b['latest_version']));
+
+        return array_slice($pending, 0, 10);
     }
 
     /**

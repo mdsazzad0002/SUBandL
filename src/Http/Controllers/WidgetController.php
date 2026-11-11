@@ -86,7 +86,10 @@ class WidgetController extends Controller
                 'checked_at' => $notice['checked_at'],
                 'running' => $updater->isRunning($state),
                 // Downloaded in the background ahead of time: ready | downloading | failed | null.
-                'package' => $notice['available'] ? $updater->packageStatus($notice['latest_version']) : null,
+                'package' => $notice['available'] ? $updater->packageStatus($notice['latest_version'], $notice['pending_versions'] ?? []) : null,
+                // Several versions waiting: they install one after another in one go.
+                'pending_versions' => $notice['pending_versions'] ?? [],
+                'target_version' => $notice['target_version'] ?? null,
                 'updates_included' => $state->updatesIncluded(),
                 'retry_at' => optional($health->backoffUntil())->toDateTimeString(),
                 // The last server-side health ping before a live call.

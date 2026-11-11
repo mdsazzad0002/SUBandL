@@ -12,12 +12,21 @@ use SUBandL\Update\UpdateApplier;
  */
 class UpdatePrefetchCommand extends Command
 {
-    protected $signature = 'subandl:update-prefetch {--check : Ask the provider again instead of using the last check}';
+    protected $signature = 'subandl:update-prefetch
+        {--check : Ask the provider again instead of using the last check}
+        {--for-update : Download for the update now running (its chunks follow this process)}';
 
     protected $description = 'Download the next update package in the background, ready to install.';
 
     public function handle(UpdateApplier $applier, SUBandL $subandl): int
     {
+        if ($this->option('for-update')) {
+            $result = $applier->prefetch(null, forUpdate: true);
+            $this->{($result['ok'] ?? false) ? 'info' : 'warn'}($result['message'] ?? 'Done.');
+
+            return self::SUCCESS;
+        }
+
         $result = $this->option('check') ? $this->fresh($applier, $subandl) : $applier->prefetch();
 
         // The saved answer is missing, or its (possibly signed) link no longer

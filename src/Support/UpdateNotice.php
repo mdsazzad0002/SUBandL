@@ -30,6 +30,7 @@ class UpdateNotice
             'version_title' => $check['version_title'] ?? null,
             'locked' => (bool) ($check['locked'] ?? false),
             'monthly_fee' => $check['monthly_fee'] ?? null,
+            'pending' => array_map(fn ($p) => ['version' => $p['latest_version'], 'title' => $p['version_title'] ?? null], $check['pending'] ?? []),
             'checked_at' => now()->toDateTimeString(),
         ]);
 
@@ -48,6 +49,7 @@ class UpdateNotice
         $current = (string) config('subandl.version', '1.0.0');
 
         $available = $latest && version_compare((string) $latest, $current, '>');
+        $pending = $available ? self::stillPending($notice['pending'] ?? [], (string) $latest, $current) : [];
 
         return [
             'available' => $available,
@@ -57,8 +59,29 @@ class UpdateNotice
             'version_title' => $available ? ($notice['version_title'] ?? null) : null,
             'locked' => $available && ($notice['locked'] ?? false),
             'monthly_fee' => $notice['monthly_fee'] ?? null,
+            // The newer versions still to install (oldest first) and the last of them.
+            'pending_versions' => $pending,
+            'target_version' => $available ? (end($pending) ?: $latest) : null,
             'checked_at' => $notice['checked_at'] ?? null,
         ];
+    }
+
+    /** @return list<string> versions newer than $current, oldest first; at least the announced one */
+    private static function stillPending(array $pending, string $latest, string $current): array
+    {
+        $versions = [];
+        foreach ($pending as $p) {
+            $v = (string) ($p['version'] ?? '');
+            if ($v !== '' && version_compare($v, $current, '>')) {
+                $versions[] = $v;
+            }
+        }
+        if (! in_array($latest, $versions, true)) {
+            $versions[] = $latest;
+        }
+        usort($versions, 'version_compare');
+
+        return array_values(array_unique($versions));
     }
 
     public static function checkedAt(): ?string

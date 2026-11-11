@@ -222,7 +222,16 @@ root.innerHTML = `
     <div class="sbw-modal sbw-paymodal" hidden>
         <div class="sbw-modal-card sbw-paycard" role="alertdialog" aria-modal="true" aria-labelledby="sbw-pay-title"></div>
     </div>
-    <div class="sbw-banner" role="status" hidden></div>`;
+    <div class="sbw-banner" role="status" hidden></div>
+    <div class="sbw-mini" role="status" aria-live="polite" hidden>
+        <button type="button" class="sbw-mini-main" data-sbw="update-restore" title="Show details">
+            <span class="sbw-mini-ring"><span class="sbw-mini-pct">0%</span></span>
+            <span class="sbw-mini-text"><strong class="sbw-mini-title">Updating…</strong><span class="sbw-mini-sub">Click to see details</span></span>
+        </button>
+        <button type="button" class="sbw-btn sbw-mini-act" data-sbw="update-run-mini" hidden>Install now</button>
+        <button type="button" class="sbw-icon sbw-mini-x" data-sbw="update-mini-close" aria-label="Hide" hidden>${icons.close}</button>
+        <span class="sbw-mini-bar"><span></span></span>
+    </div>`;
 
 const $ = (sel) => root.querySelector(sel);
 const panel = $('.sbw-panel');
@@ -235,6 +244,12 @@ const payCard = $('.sbw-paycard');
 const banner = $('.sbw-banner');
 const noticeModal = $('.sbw-noticemodal');
 const noticeCard = $('.sbw-noticecard');
+const mini = $('.sbw-mini');
+
+// Minimized update: the modal is hidden and a small pill (bottom corner) keeps
+// showing the progress while the user works elsewhere in the app.
+let minimized = false;
+let pillDismissed = false; // the user closed the download pill: don't bring it back on this page
 
 /* ---------------------------------------------------------------- render */
 
@@ -722,6 +737,7 @@ function patchStages() {
         }
     };
 
+    updateMini(view);
     const head = modalCard.querySelector('.sbw-stages-head');
     setText(head?.querySelector('span'), view.title);
     setText(head?.querySelector('strong'), view.overall + '%');
@@ -810,14 +826,20 @@ function patchModalLines(progress, error, pkg) {
 
 // The package is fetched in the background as soon as a new version is found,
 // so the click only has to confirm and install it.
+// How many versions this update goes through (several: installed one after another).
+const updateCount = (u) => Math.max(1, (u?.pending_versions || []).length, u?.package?.count || 0);
+const targetVersion = (u) => u?.target_version || u?.latest_version;
+
 function packageHtml(pkg) {
     const mb = (n) => (n / 1048576).toFixed(1) + ' MB';
+    const many = (pkg.count || 1) > 1;
     if (pkg.state === 'ready') {
-        return `<p class="sbw-flash sbw-ok" role="status">${icons.check} Already downloaded${pkg.total ? ` (${mb(pkg.total)})` : ''} — installs in moments.</p>`;
+        return `<p class="sbw-flash sbw-ok" role="status">${icons.check} ${many ? `All ${pkg.count} updates downloaded` : 'Already downloaded'}${pkg.total ? ` (${mb(pkg.total)})` : ''} — installs in moments.</p>`;
     }
     if (pkg.state === 'downloading') {
         const pct = pkg.total ? Math.floor((100 * pkg.received) / pkg.total) : null;
-        return `<p class="sbw-flash sbw-info" role="status">Downloading in the background…${pct !== null ? ` ${pct}% of ${mb(pkg.total)}` : ''} You can install now; it continues from there.</p>`;
+        const which = many ? ` ${Math.min(pkg.count, (pkg.ready_count || 0) + 1)} of ${pkg.count}${pkg.current ? ` (v${esc(pkg.current)})` : ''}` : '';
+        return `<p class="sbw-flash sbw-info" role="status">Downloading${which} in the background…${pct !== null ? ` ${pct}% of ${mb(pkg.total)}` : ''} You'll get a notice when ${many ? 'all are' : 'it is'} ready; you can also install now.</p>`;
     }
     return '';
 }
@@ -853,7 +875,7 @@ function renderModal(u, progress = null, error = null) {
 
     // Same card, new numbers: patch in place instead of rebuilding.
     const pkg = u.package || {};
-    const shape = JSON.stringify([u.latest_version, state.version, updateStep, busy, !!error, ready, pkg.state, !!(ready && news)]);
+    const shape = JSON.stringify([u.latest_version, targetVersion(u), updateCount(u), state.version, updateStep, busy, !!error, ready, pkg.state, !!(ready && news)]);
     if (shape === modalShape && modalCard.firstElementChild) {
         if (modalCard.querySelector('.sbw-stages')) patchStages();
         patchModalLines(progress, error, pkg);
@@ -865,9 +887,9 @@ function renderModal(u, progress = null, error = null) {
         <div class="sbw-hero">
             <span class="sbw-hero-icon">${icons.gift}</span>
             <div>
-                <p class="sbw-hero-kicker">${updateStep === 'done' ? 'Update complete' : 'A new version is ready'}</p>
-                <h2 id="sbw-modal-title">v${esc(u.latest_version)}${u.version_title ? ` · ${esc(u.version_title)}` : ''}</h2>
-                <p class="sbw-versions"><span>Installed v${esc(state.version)}</span> → <strong>v${esc(u.latest_version)}</strong></p>
+                <p class="sbw-hero-kicker">${updateStep === 'done' ? 'Update complete' : updateCount(u) > 1 ? `${updateCount(u)} updates are ready` : 'A new version is ready'}</p>
+                <h2 id="sbw-modal-title">${updateCount(u) > 1 ? `v${esc(u.latest_version)} → v${esc(targetVersion(u))}` : `v${esc(u.latest_version)}${u.version_title ? ` · ${esc(u.version_title)}` : ''}`}</h2>
+                <p class="sbw-versions"><span>Installed v${esc(state.version)}</span> → <strong>v${esc(targetVersion(u))}</strong>${updateCount(u) > 1 ? ` <span>(${updateCount(u)} steps, one after another)</span>` : ''}</p>
             </div>
         </div>
         <div class="sbw-modal-body">
@@ -882,6 +904,7 @@ function renderModal(u, progress = null, error = null) {
             <p class="sbw-flash sbw-bad" role="alert" data-sbw-line="error"${error ? '' : ' hidden'}>${esc(error || '')}</p>
             <div class="sbw-actions">
                 ${u.force_update || busy ? '' : `<button type="button" class="sbw-btn sbw-ghost" data-sbw="update-later">${error ? 'Close' : 'Later'}</button>`}
+                ${busy === 'update' || (ready && pkg.state === 'downloading') ? `<button type="button" class="sbw-btn sbw-ghost" data-sbw="update-minimize" title="${busy ? 'Keep working — the update continues in the background' : 'Keep working — you get a notice when the download is done'}">Minimize</button>` : ''}
                 ${updateStep === 'done' ? '' : `<button type="button" class="sbw-btn sbw-btn-lg" data-sbw="update-run" ${actionOff()}>${busy === 'update' ? 'Updating…' : error ? 'Try again' : pkg.state === 'ready' ? 'Install now' : 'Update now'}</button>`}
             </div>
         </div>`);
@@ -971,9 +994,213 @@ function showModal() {
 function hideModal() {
     modal.hidden = true;
     if (!busy) {
+        minimized = false;
+        mini.hidden = true;
+    }
+    if (!busy) {
         updateStep = null;
         liveProgress = null;
     }
+}
+
+// Two modes: 'update' (an install in progress / just finished) and 'download'
+// (the package fetching in the background, then "ready — Install now").
+function updateMini(view = null) {
+    if (!minimized) return;
+    const u = state?.update || {};
+    const pkg = u.package || {};
+    const installing = busy === 'update' || updateStep === 'done' || updateStep === 'failed';
+    const set = (sel, text) => {
+        const el = mini.querySelector(sel);
+        if (el && el.textContent !== text) el.textContent = text;
+    };
+    let pct;
+    let title;
+    let sub;
+    let mode;
+
+    if (installing) {
+        view = view || stagesView();
+        const done = updateStep === 'done';
+        const failed = updateStep === 'failed';
+        mode = done ? 'done' : failed ? 'failed' : 'busy';
+        pct = done ? 100 : view.overall;
+        title = done ? `Updated to v${u.latest_version || ''}` : failed ? 'Update failed' : view.title;
+        const running = view.stages.find((st) => st.status === 'running');
+        sub = done ? 'Click to reload and use the new version' : failed ? 'Click to see what happened' : running ? `${running.label} ${running.pctLabel}` : 'Click to see details';
+        set('.sbw-mini-pct', done ? '✓' : failed ? '!' : pct + '%');
+    } else if (pkg.state === 'ready') {
+        const n = updateCount(u);
+        mode = 'ready';
+        pct = 100;
+        title = n > 1 ? `${n} updates ready` : `v${u.latest_version || ''} downloaded`;
+        sub = n > 1 ? `v${u.latest_version} → v${targetVersion(u)} — installs in moments` : 'Ready to install — takes moments';
+        set('.sbw-mini-pct', '✓');
+    } else if (pkg.state === 'downloading') {
+        const n = updateCount(u);
+        mode = 'busy';
+        pct = pkg.total ? Math.floor((100 * pkg.received) / pkg.total) : 0;
+        title = n > 1 ? `Downloading update ${Math.min(n, (pkg.ready_count || 0) + 1)} of ${n}` : `Downloading v${u.latest_version || ''}`;
+        const mb = (x) => (x / 1048576).toFixed(1);
+        sub = (n > 1 && pkg.current ? `v${pkg.current} · ` : '') + (pkg.total ? `${mb(pkg.received)} of ${mb(pkg.total)} MB — you'll be notified` : "You'll be notified when done");
+        set('.sbw-mini-pct', pkg.total ? pct + '%' : '…');
+    } else {
+        // Nothing to show any more (download failed / update gone): back to the modal.
+        mode = 'failed';
+        pct = 0;
+        title = pkg.state === 'failed' ? 'Download failed' : 'Update';
+        sub = 'Click to see details';
+        set('.sbw-mini-pct', '!');
+    }
+
+    mini.dataset.mode = mode;
+    set('.sbw-mini-title', title);
+    set('.sbw-mini-sub', sub);
+    mini.querySelector('.sbw-mini-act').hidden = mode !== 'ready';
+    mini.querySelector('.sbw-mini-x').hidden = installing;
+    mini.querySelector('.sbw-mini-bar span').style.width = pct + '%';
+    mini.querySelector('.sbw-mini-bar').classList.toggle('sbw-bar-busy', mode === 'busy' && !installing && !pkg.total);
+}
+
+// The download finished while the user was elsewhere: say so, with a button.
+function notifyPackageReady() {
+    if (busy || !state?.update?.available || state.update.locked) return;
+    if (!modal.hidden) return; // the open modal already switches to "Install now"
+
+    // Everything is downloaded: pop the update up (a new event, so even after
+    // "Later") — unless another dialog or the panel is in the way.
+    if (payModal.hidden && noticeModal.hidden && !panelOpen) {
+        minimized = false;
+        mini.hidden = true;
+        modalDismissedFor = null;
+        showModal();
+        return;
+    }
+    minimized = true;
+    mini.hidden = false;
+    updateMini();
+    mini.classList.remove('sbw-mini-ping');
+    void mini.offsetWidth; // restart the attention animation
+    mini.classList.add('sbw-mini-ping');
+}
+
+// The server downloads the package in the background; while it does, look at
+// its progress every few seconds instead of the usual 5 minutes.
+let pkgPoll = null;
+let lastPkgState = null;
+function watchPackage() {
+    const st = state?.update?.package?.state || null;
+    if (lastPkgState === 'downloading' && st === 'ready') notifyPackageReady();
+    lastPkgState = st;
+    clearTimeout(pkgPoll);
+    if (st === 'downloading' && !busy) {
+        pkgPoll = setTimeout(() => (document.visibilityState === 'visible' ? refresh(true) : watchPackage()), 3000);
+    }
+}
+
+function minimizeModal() {
+    minimized = true;
+    if (busy === 'update') saveRun({ minimized: true });
+    modal.hidden = true;
+    mini.hidden = false;
+    updateMini();
+}
+
+function restoreModal() {
+    if (updateStep === 'done') {
+        window.location.reload();
+        return;
+    }
+    minimized = false;
+    mini.hidden = true;
+    mini.classList.remove('sbw-mini-ping');
+    if (busy === 'update') saveRun({ minimized: false });
+    renderModal(state.update);
+    modal.hidden = false;
+}
+
+/* ---- resume after a reload ----------------------------------------------
+ * Each version step is driven from the page in chunks, tagged with a run id.
+ * The run id is remembered, so after a reload (or the tab being reopened) the
+ * page carries the SAME job on — the server continues where it stopped
+ * instead of starting the update again. A heartbeat keeps two tabs from
+ * driving one update at the same time.
+ */
+const RUN_KEY = 'subandl-widget:update-run';
+const RESUME_MAX_AGE = 30 * 60 * 1000;
+const tabId = (() => {
+    try {
+        let id = sessionStorage.getItem('subandl-widget:tab');
+        if (!id) {
+            id = Math.random().toString(36).slice(2, 10);
+            sessionStorage.setItem('subandl-widget:tab', id);
+        }
+        return id;
+    } catch (e) {
+        return Math.random().toString(36).slice(2, 10);
+    }
+})();
+
+function savedRun() {
+    try {
+        const v = JSON.parse(localStorage.getItem(RUN_KEY) || 'null');
+        return v && v.run && Date.now() - (v.at || 0) < RESUME_MAX_AGE ? v : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+function saveRun(patch) {
+    try {
+        const v = { ...(savedRun() || {}), ...patch, tab: tabId, at: Date.now() };
+        localStorage.setItem(RUN_KEY, JSON.stringify(v));
+    } catch (e) {
+        // Storage blocked: a reload just won't resume.
+    }
+}
+
+function clearRun() {
+    try {
+        localStorage.removeItem(RUN_KEY);
+    } catch (e) {
+        // ignore
+    }
+}
+
+let resumeChecked = false;
+
+// After a reload: is there an update this page (tab) was driving? Carry it on.
+async function maybeResume() {
+    if (resumeChecked || busy || unlicensed()) return;
+    const saved = savedRun();
+    if (!saved && !state?.update?.running) return;
+    resumeChecked = true;
+
+    // Another open tab is driving it right now: leave it to that one.
+    if (saved && saved.tab !== tabId && Date.now() - saved.at < 15000) return;
+
+    const r = await api.updateStatus();
+    const prog = r.ok ? r.data.progress : null;
+    if (!prog || !prog.run) return;
+    const failed = Object.values(prog.stages || {}).some((st) => st && st.status === 'failed');
+    if (failed && !r.data.running) {
+        clearRun();
+        return;
+    }
+    const ours = saved?.run === prog.run;
+    if (!ours) {
+        // Not started from this browser: take it over only when nobody drives it
+        // any more (its progress stood still for 15s) — another admin's browser
+        // may be updating right now, and its page should stay in charge.
+        if (!r.data.running) return;
+        await new Promise((resolve) => setTimeout(resolve, 15000));
+        if (busy) return;
+        const again = await api.updateStatus();
+        const now = again.ok ? again.data.progress : null;
+        if (!again.ok || !again.data.running || !now || now.run !== prog.run || now.updated_at !== prog.updated_at) return;
+    }
+
+    runUpdate({ run: prog.run, progress: prog, minimized: ours && !!saved?.minimized });
 }
 
 function showPayModal() {
@@ -1015,7 +1242,17 @@ function autoPrompt() {
     // "Updating…" on screen while this page is not the one updating: look again
     // every minute, so the Update button is back as soon as the server clears it.
     if (u?.running && busy !== 'update' && document.visibilityState === 'visible') refresh(true);
-    if (u?.available && !u.running && !unlicensed() && modal.hidden && payModal.hidden && noticeModal.hidden
+    // Still downloading in the background: no popup yet — a quiet pill shows the
+    // progress, and the popup comes when everything is ready (notifyPackageReady).
+    if (u?.available && !u.running && !u.force_update && !u.locked && u.package?.state === 'downloading' && modal.hidden && !busy) {
+        if (!minimized && !pillDismissed) {
+            minimized = true;
+            mini.hidden = false;
+            updateMini();
+        }
+        return;
+    }
+    if (u?.available && !u.running && !unlicensed() && modal.hidden && !minimized && payModal.hidden && noticeModal.hidden
         && modalDismissedFor !== u.latest_version
         && (u.force_update || !snoozed(UPDATE_SNOOZE_KEY + u.latest_version))) {
         showModal();
@@ -1043,6 +1280,15 @@ async function refresh(force = false) {
     if (!(root.contains(document.activeElement) && document.activeElement.tagName === 'INPUT')) {
         render();
     }
+    // Background download moving: patch the open modal / the pill in place.
+    if (!busy && state.update && !updateStep) {
+        if (!modal.hidden) renderModal(state.update);
+        updateMini();
+    }
+    watchPackage();
+    // Not awaited: a takeover check may wait 15s, and nothing below depends on
+    // it (autoPrompt never offers "Update now" while an update is running).
+    maybeResume();
     autoPrompt();
 }
 
@@ -1070,17 +1316,25 @@ function applyVisibility() {
     renderBanner();
 }
 
-async function runUpdate() {
+async function runUpdate(resume = null) {
     if (busy || unlicensed()) return;
     busy = 'update';
     updateStep = 'running';
-    liveProgress = null;
+    liveProgress = resume?.progress || null;
     liveStepNo = 1;
-    renderModal(state.update);
+    renderModal(state.update, resume ? 'Continuing the update where it stopped…' : null);
     render();
+    if (resume?.minimized) {
+        minimizeModal();
+    } else {
+        minimized = false;
+        mini.hidden = true;
+        modal.hidden = false;
+    }
 
-    // 1. The server confirms the provider is reachable before anything changes.
-    const pre = await api.preflight();
+    // 1. The server confirms the provider is reachable before anything changes
+    //    (not again when carrying on a job that already passed it).
+    const pre = resume ? { ok: true } : await api.preflight();
     if (!pre.ok) {
         busy = null;
         updateStep = 'failed';
@@ -1092,8 +1346,13 @@ async function runUpdate() {
 
     // 2. Backup, download, merge and migrate, one version step at a time;
     //    every stage reports its own percentage while the step runs.
-    let note = null;
+    let note = resume ? 'Continuing the update where it stopped…' : null;
+    let beat = 0;
     const result = await api.runUpdate(({ message, step, progress, version, more }) => {
+        if (Date.now() - beat > 3000) {
+            beat = Date.now();
+            saveRun({}); // heartbeat: this tab is driving the update
+        }
         if (step && step !== liveStepNo) liveProgress = null;
         liveStepNo = step || liveStepNo;
         if (progress) liveProgress = mergeProgress(liveProgress, progress);
@@ -1103,12 +1362,23 @@ async function runUpdate() {
         else if (!progress && message) note = message;
         else if (progress && note && !version) note = null;
         renderModal(state.update, note);
+        updateMini();
+    }, {
+        resumeRun: resume?.run || null,
+        onRun: (run) => saveRun({ run, minimized }),
     });
     busy = null;
+    clearRun();
     if (result.progress) liveProgress = mergeProgress(liveProgress, result.progress);
 
     if (result.ok) {
         updateStep = 'done';
+        if (minimized) {
+            // The user is working: don't yank the page away, let them reload when ready.
+            renderModal(state.update, (result.message || 'Update applied.') + ' Reload to use the new version.');
+            updateMini();
+            return;
+        }
         renderModal(state.update, (result.message || 'Update applied.') + ' Reloading…');
         setTimeout(() => window.location.reload(), 1800);
         return;
@@ -1116,6 +1386,7 @@ async function runUpdate() {
 
     updateStep = 'failed';
     renderModal(state.update, null, result.message || 'Update failed.');
+    if (minimized) restoreModal();
     refresh(true);
 }
 
@@ -1372,6 +1643,21 @@ root.addEventListener('click', (event) => {
         case 'update-run':
             runUpdate();
             break;
+        case 'update-minimize':
+            minimizeModal();
+            break;
+        case 'update-restore':
+            restoreModal();
+            break;
+        case 'update-run-mini':
+            restoreModal();
+            runUpdate();
+            break;
+        case 'update-mini-close':
+            minimized = false;
+            mini.hidden = true;
+            pillDismissed = true;
+            break;
         case 'update-subscribe':
             modalDismissedFor = state.update.latest_version;
             hideModal();
@@ -1465,6 +1751,8 @@ document.addEventListener('keydown', (event) => {
         snoozePayment();
     } else if (!noticeModal.hidden) {
         hideNoticeModal();
+    } else if (!modal.hidden && busy === 'update') {
+        minimizeModal();
     } else if (!modal.hidden && !busy && !state?.update?.force_update) {
         modalDismissedFor = state.update.latest_version;
         hideModal();

@@ -53,6 +53,9 @@ class UpdateApplier
     /** Extra listener for download progress (the background prefetch's status file). @var callable|null */
     private $onDownloadProgress = null;
 
+    /** While prefetch() works through several versions: versions, sizes, index, done (bytes of the finished ones). */
+    private ?array $queue = null;
+
     public function __construct(private readonly BackupService $backupService)
     {
     }
@@ -156,6 +159,12 @@ class UpdateApplier
      */
     public function begin(string $run, array $updateInfo): void
     {
+        // An earlier job abandoned mid-merge (tab closed, then replaced by this
+        // run) may have left staged temp files next to the app's files.
+        if (($old = $this->loadJob()) !== null && ($old['run'] ?? null) !== $run) {
+            $this->discardStaged($old);
+        }
+
         LicenseState::current()->forceFill(['update_running' => true, 'update_started_at' => now()])->save();
         UpdateProgress::target($updateInfo['latest_version'] ?? null);
 
@@ -500,6 +509,10 @@ class UpdateApplier
 
         // A verified package is kept for the retry (cleaned after a day); a
         // partial download is not resumed by a new job, so it goes.
+        if (! $ok) {
+            $this->discardStaged($job);
+        }
+
         $download = $job['download'] ?? [];
         if (! empty($download['part'])) {
             @unlink($download['part']);
@@ -701,6 +714,18 @@ class UpdateApplier
                 continue; // it finished (ready) or stopped (download here, from where it got to)
             }
 
+            // Handed to a background process (see below) that has not shown up yet:
+            // give it a moment; if it never starts, download here without a budget.
+            if (isset($job['handoff_at'])) {
+                if ($deadline !== INF && time() - (int) $job['handoff_at'] < 20) {
+                    UpdateProgress::stage('download', 0, 'Starting the download in the background…');
+
+                    return null;
+                }
+                unset($job['handoff_at']);
+                $job['inline_download'] = true;
+            }
+
             $job['download'] = $this->newDownload($info);
             UpdateProgress::stage('download', 0, $job['download']['offset'] > 0
                 ? 'Resuming at ' . self::bytes($job['download']['offset']) . '…'
@@ -710,6 +735,22 @@ class UpdateApplier
         $d = &$job['download'];
         if (! isset($d['part'])) {
             return ['ok' => true]; // reused package
+        }
+
+        // The provider ignores Range (sends the whole file every time): a chunked
+        // download would restart at 0 every chunk and never finish once the file
+        // takes longer than one chunk on the line. Download it in one go — in a
+        // detached process the chunks follow, or (no way to spawn one) right here.
+        if ($deadline !== INF && ! empty($job['no_range'])) {
+            if (empty($job['inline_download']) && $this->startBackgroundDownload($info)) {
+                unset($job['download']);
+                $job['handoff_at'] = time();
+                UpdateProgress::stage('download', 0, 'The update server cannot resume downloads; downloading in the background…');
+
+                return null;
+            }
+            Platform::allowLongRunning();
+            $deadline = INF;
         }
 
         // Only one process downloads a package at a time (this, or the prefetch).
@@ -726,6 +767,9 @@ class UpdateApplier
             return ['ok' => false, 'message' => 'Update package download failed: ' . $e->getMessage()];
         } finally {
             $this->releaseLock($lock);
+        }
+        if (! empty($d['no_range'])) {
+            $job['no_range'] = true;
         }
 
         if ($received !== true) {
@@ -848,9 +892,9 @@ class UpdateApplier
 
             $error = null;
             try {
-                HttpClient::request()->timeout((int) config('subandl.update.download_timeout', 300))
+                HttpClient::request()->timeout($this->downloadTimeout($deadline))
                     ->withHeaders($from > 0 || $deadline !== INF ? ['Range' => "bytes={$from}-"] : [])
-                    ->withOptions($options)
+                    ->withOptions($options + $this->stallOptions())
                     ->get($d['url']);
             } catch (\Throwable $e) {
                 $error = $sink->budgetSpent ? null : $e;
@@ -861,6 +905,13 @@ class UpdateApplier
 
             [$kind, $value] = $answer ?? [null, null];
             if ($kind === 'whole') {
+                // A 200 to "bytes=<offset>-" with offset > 0 means the server ignores
+                // Range, so a budget-cut download could never be resumed. (A 200 to
+                // "bytes=0-" proves nothing: some servers answer a whole-file range
+                // with 200 although they support ranges.)
+                if ($deadline !== INF && $from > 0) {
+                    $d['no_range'] = true;
+                }
                 $d['offset'] = 0;
                 $d['total'] = $value;
             } elseif ($kind === 'partial' && $value > 0) {
@@ -917,6 +968,34 @@ class UpdateApplier
     }
 
     /**
+     * Total time one download request may take. A budget-cut chunk needs no
+     * more than its budget (plus slack); a download without a budget (the
+     * background one, the CLI) gets none — on a slow line a big package takes
+     * longer than any fixed limit, and a cut-off would restart it from 0 on a
+     * server without Range. A dead connection is caught by stallOptions().
+     */
+    private function downloadTimeout(float $deadline): int
+    {
+        $configured = (int) config('subandl.update.download_timeout', 300);
+        if ($deadline === INF) {
+            return 0; // no limit (Guzzle: 0 = none)
+        }
+
+        return max(30, min($configured, (int) ceil($deadline - microtime(true)) + 30));
+    }
+
+    /** Give up on a connection that stalls (under 1 KB/s for 60s) or never connects. */
+    private function stallOptions(): array
+    {
+        $options = ['connect_timeout' => 20];
+        if (defined('CURLOPT_LOW_SPEED_LIMIT') && defined('CURLOPT_LOW_SPEED_TIME')) {
+            $options['curl'] = [CURLOPT_LOW_SPEED_LIMIT => 1024, CURLOPT_LOW_SPEED_TIME => 60];
+        }
+
+        return $options;
+    }
+
+    /**
      * Opens the package and merges as much of it as the budget allows,
      * continuing from the cursor the last chunk saved in the job.
      *
@@ -969,7 +1048,7 @@ class UpdateApplier
                 || ($check['locked'] ?? false) || empty($check['download_url'])
                 || ! LicenseState::current()->updatesIncluded()
                 || $this->activeJob() || $this->prefetchRunning()
-                || $this->packageStatus((string) ($check['latest_version'] ?? ''))['state'] === 'ready') {
+                || $this->packageStatus((string) ($check['latest_version'] ?? ''), self::checkVersions($check))['state'] === 'ready') {
                 return;
             }
 
@@ -1001,7 +1080,7 @@ class UpdateApplier
      *
      * @param array|null $check  the provider's update answer; null: the one schedulePrefetch() saved
      */
-    public function prefetch(?array $check = null): array
+    public function prefetch(?array $check = null, bool $forUpdate = false): array
     {
         if ($check === null) {
             $saved = json_decode((string) @file_get_contents($this->prefetchRequestPath()), true);
@@ -1011,21 +1090,102 @@ class UpdateApplier
             return ['ok' => false, 'message' => 'No update to download.'];
         }
 
-        $version = (string) ($check['latest_version'] ?? '');
-        if ($this->activeJob()) {
+        if (! $forUpdate && $this->activeJob()) {
             return ['ok' => true, 'skipped' => true, 'message' => 'An update is being installed; it prepares the package itself.'];
         }
 
-        $download = $this->prefetchDownload($check, $version);
-        if (! ($download['ok'] ?? false) || ($download['skipped'] ?? false)) {
-            return $download;
+        // Every pending version, oldest first (one when the provider does not list
+        // them, or for the running update's own package): when the user installs,
+        // all steps go through without waiting for a download.
+        $items = $forUpdate ? [$check] : $this->fitOnDisk($this->prefetchQueue($check));
+        $this->queue = [
+            'versions' => array_map(fn ($i) => (string) ($i['latest_version'] ?? ''), $items),
+            'sizes' => array_map(fn ($i) => (int) ($i['size'] ?? $i['file_size'] ?? 0), $items),
+            'index' => 0,
+            'done' => 0,
+        ];
+
+        try {
+            foreach ($items as $n => $info) {
+                $version = (string) ($info['latest_version'] ?? '');
+                $this->queue['index'] = $n;
+                $download = $this->prefetchDownload($info, $version);
+                if (! ($download['ok'] ?? false) || ($download['skipped'] ?? false)) {
+                    return $download;
+                }
+                $size = (int) $download['size'];
+                $this->queue['sizes'][$n] = $size;
+                $this->queue['done'] += $size;
+                ActivityLog::record('update', true, "v{$version} downloaded in the background (" . self::bytes($size) . '); ready to install.');
+            }
+
+            $count = count($items);
+            $first = $this->queue['versions'][0];
+            $this->writePrefetchStatus($first, 'ready', $this->queue['done'], $this->queue['done']);
+
+            return ['ok' => true, 'message' => $count > 1
+                ? "{$count} updates (v{$first} → v" . end($this->queue['versions']) . ') downloaded and ready to install.'
+                : "v{$first} downloaded and ready to install."];
+        } finally {
+            $this->queue = null;
+        }
+    }
+
+    /** The check's pending versions (oldest first), always starting with the announced one. */
+    private function prefetchQueue(array $check): array
+    {
+        $latest = (string) ($check['latest_version'] ?? '');
+        $items = [];
+        foreach ((array) ($check['pending'] ?? []) as $p) {
+            if (is_array($p) && ! empty($p['download_url']) && ! empty($p['latest_version'])) {
+                $items[(string) $p['latest_version']] = $p;
+            }
+        }
+        // The announced version comes from the check itself (its checksum, commands…).
+        unset($check['pending'], $check['raw']);
+        $items[$latest] = $check + ($items[$latest] ?? []);
+        uksort($items, 'version_compare');
+
+        return array_values(array_filter($items, fn ($i, $v) => version_compare((string) $v, $latest, '>='), ARRAY_FILTER_USE_BOTH));
+    }
+
+    /**
+     * As many of the queued packages as fit on the disk: room for each one plus
+     * its merge (twice its size) and 500 MB to spare. The next version is
+     * always kept — it is needed for the update either way.
+     */
+    private function fitOnDisk(array $items): array
+    {
+        $free = @disk_free_space($this->stagingDir());
+        if ($free === false || count($items) < 2) {
+            return $items;
         }
 
-        $size = (int) $download['size'];
-        $this->writePrefetchStatus($version, 'ready', $size, $size);
-        ActivityLog::record('update', true, "v{$version} downloaded in the background (" . self::bytes($size) . '); ready to install.');
+        $budget = $free - 500 * 1048576;
+        $kept = [];
+        foreach ($items as $n => $info) {
+            $budget -= 2 * (int) ($info['size'] ?? $info['file_size'] ?? 50 * 1048576);
+            if ($n > 0 && $budget < 0) {
+                ActivityLog::record('update', true, 'Low disk space: downloaded ' . count($kept) . ' of ' . count($items) . ' pending updates ahead; the rest download during the update.');
+                break;
+            }
+            $kept[] = $info;
+        }
 
-        return ['ok' => true, 'message' => "v{$version} downloaded and ready to install."];
+        return $kept;
+    }
+
+    /** @return list<string> the versions a check announces (oldest first) */
+    private static function checkVersions(array $check): array
+    {
+        $versions = array_values(array_filter(array_map(fn ($p) => (string) ($p['latest_version'] ?? ''), (array) ($check['pending'] ?? []))));
+        $latest = (string) ($check['latest_version'] ?? '');
+        if ($latest !== '' && ! in_array($latest, $versions, true)) {
+            $versions[] = $latest;
+        }
+        usort($versions, 'version_compare');
+
+        return $versions;
     }
 
     /**
@@ -1083,47 +1243,88 @@ class UpdateApplier
     }
 
     /**
+     * Starts `subandl:update-prefetch --for-update` for the running update's
+     * package (a provider without Range support: see fetchPackage()).
+     */
+    private function startBackgroundDownload(array $info): bool
+    {
+        $dir = $this->stagingDir();
+        if (! is_dir($dir) && ! @mkdir($dir, 0755, true) && ! is_dir($dir)) {
+            return false;
+        }
+        unset($info['raw']);
+        if (@file_put_contents($this->prefetchRequestPath(), json_encode(['check' => $info, 'at' => time()])) === false) {
+            return false;
+        }
+
+        return BackgroundArtisan::dispatch('subandl:update-prefetch', ['--for-update']);
+    }
+
+    /**
      * What the widget shows about the next version's package: downloading →
      * ready (failed: the background download did not work and happens during
      * the update instead; null: not downloaded ahead).
      *
      * @return array{state: ?string, received: int, total: int, message: ?string}
      */
-    public function packageStatus(?string $version): array
+    public function packageStatus(?string $version, array $versions = []): array
     {
-        $status = ['state' => null, 'received' => 0, 'total' => 0, 'message' => null];
+        $status = ['state' => null, 'received' => 0, 'total' => 0, 'message' => null, 'count' => 0, 'ready_count' => 0, 'current' => null];
         if (! $version) {
             return $status;
         }
 
+        $versions = array_values(array_unique(array_filter(array_map('strval', $versions ?: [$version]))));
+        if (! in_array($version, $versions, true)) {
+            array_unshift($versions, $version);
+        }
+        $status['count'] = count($versions);
+
         $saved = json_decode((string) @file_get_contents($this->prefetchStatusPath()), true);
-        $saved = is_array($saved) && ($saved['version'] ?? null) === $version ? $saved : null;
+        $saved = is_array($saved) && (($saved['version'] ?? null) === $version || in_array($version, (array) ($saved['versions'] ?? []), true)) ? $saved : null;
 
-        $tag = preg_replace('/[^0-9A-Za-z._-]/', '', $version);
-        foreach (glob($this->stagingDir() . DIRECTORY_SEPARATOR . "update-{$tag}-*.zip") ?: [] as $zip) {
-            $meta = $this->packageMeta($zip);
-            if ($meta === null || ($meta['version'] ?? null) !== $version) {
-                continue;
+        $readyBytes = 0;
+        foreach ($versions as $v) {
+            $size = $this->readySize($v);
+            if ($size !== null) {
+                $status['ready_count']++;
+                $readyBytes += $size;
             }
+        }
 
-            return [
-                'state' => 'ready',
-                'received' => $meta['size'],
-                'total' => $meta['size'],
-                'message' => $saved['message'] ?? null,
-            ];
+        if ($status['ready_count'] === $status['count']) {
+            return ['state' => 'ready', 'received' => $readyBytes, 'total' => $readyBytes, 'message' => $saved['message'] ?? null] + $status;
         }
 
         if ($saved !== null) {
+            // Between two packages the download lock is free for a moment: a status
+            // written seconds ago still means "downloading".
+            $running = $this->prefetchRunning()
+                || (($saved['state'] ?? null) === 'downloading' && time() - (int) ($saved['at'] ?? 0) < 15);
             $status = [
-                'state' => $this->prefetchRunning() ? 'downloading' : (($saved['state'] ?? null) === 'failed' ? 'failed' : null),
+                'state' => $running ? 'downloading' : (($saved['state'] ?? null) === 'failed' ? 'failed' : null),
                 'received' => (int) ($saved['received'] ?? 0),
                 'total' => (int) ($saved['total'] ?? 0),
                 'message' => $saved['message'] ?? null,
-            ];
+                'current' => $saved['current'] ?? null,
+            ] + $status;
         }
 
         return $status;
+    }
+
+    /** Size of the verified, ready package of $version, or null. */
+    private function readySize(string $version): ?int
+    {
+        $tag = preg_replace('/[^0-9A-Za-z._-]/', '', $version);
+        foreach (glob($this->stagingDir() . DIRECTORY_SEPARATOR . "update-{$tag}-*.zip") ?: [] as $zip) {
+            $meta = $this->packageMeta($zip);
+            if ($meta !== null && ($meta['version'] ?? null) === $version) {
+                return (int) $meta['size'];
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -1283,6 +1484,21 @@ class UpdateApplier
 
     private function writePrefetchStatus(string $version, string $state, int $received, int $total, ?string $message = null): void
     {
+        $extra = [];
+        if ($this->queue !== null) {
+            // Several packages: one bar over all of them.
+            $q = $this->queue;
+            $sizes = $q['sizes'];
+            $sizes[$q['index']] = max((int) ($sizes[$q['index']] ?? 0), $total);
+            $known = array_sum($sizes);
+            $extra = ['versions' => $q['versions'], 'current' => $q['versions'][$q['index']] ?? $version, 'index' => $q['index']];
+            if ($state !== 'ready') {
+                $received = $q['done'] + $received;
+                $total = $known;
+            }
+            $version = $q['versions'][0] ?? $version;
+        }
+
         @file_put_contents($this->prefetchStatusPath(), json_encode([
             'version' => $version,
             'state' => $state,
@@ -1290,7 +1506,7 @@ class UpdateApplier
             'total' => $total,
             'message' => $message,
             'at' => time(),
-        ]));
+        ] + $extra));
     }
 
     private function prefetchStatusPath(): string
@@ -1427,7 +1643,7 @@ class UpdateApplier
         $destination = rtrim($destination, '/\\');
         $manifest = $this->loadManifest($destination);
         $seen = [];
-        $cursor += ['compared' => 0, 'compare_done' => false, 'changed' => [], 'changed_bytes' => 0, 'unchanged' => 0, 'written' => 0, 'done_bytes' => 0];
+        $cursor += ['compared' => 0, 'compare_done' => false, 'changed' => [], 'changed_bytes' => 0, 'unchanged' => 0, 'written' => 0, 'done_bytes' => 0, 'pending' => []];
 
         // Pass 1: find what actually changed.
         if (! $cursor['compare_done']) {
@@ -1470,7 +1686,13 @@ class UpdateApplier
             $cursor['compare_done'] = true;
         }
 
-        // Pass 2: write only the changed entries.
+        // Pass 2: stage only the changed entries. A file that already exists gets
+        // its new content in a temp file next to it — the running app keeps
+        // reading the old one — and all of them are switched in Pass 3 at once.
+        // Writing straight over each file in turn left a window of minutes in
+        // which a request (the user works on while the update runs) could load
+        // a new class next to an old one. Brand-new files go straight in: old
+        // code never loads them.
         $total = count($cursor['changed']);
         $startedAt = $cursor['written'];
         while ($cursor['written'] < $total) {
@@ -1491,8 +1713,9 @@ class UpdateApplier
 
             // Laravel turns warnings into ErrorException; both that and a
             // plain failure end the extraction with the entry named.
+            $staged = null;
             try {
-                $error = $this->extractEntry($zip, $i, $destination . '/' . $relative, $stat);
+                $error = $this->extractEntry($zip, $i, $destination . '/' . $relative, $stat, $staged);
             } catch (\ErrorException $e) {
                 $error = $e->getMessage();
             }
@@ -1509,19 +1732,99 @@ class UpdateApplier
                 ];
             }
 
-            $seen[$relative] = $stat;
+            if ($staged !== null) {
+                $cursor['pending'][] = [$staged, $relative, $i]; // goes live in Pass 3
+            } else {
+                $seen[$relative] = $stat;
+                self::forgetCompiled($destination . '/' . $relative);
+            }
             $cursor['written']++;
             $cursor['done_bytes'] += (int) $stat['size'];
             UpdateProgress::stage(
                 'merge',
-                15 + 85 * ($cursor['changed_bytes'] > 0 ? $cursor['done_bytes'] / $cursor['changed_bytes'] : $cursor['written'] / max(1, $total)),
+                15 + 80 * ($cursor['changed_bytes'] > 0 ? $cursor['done_bytes'] / $cursor['changed_bytes'] : $cursor['written'] / max(1, $total)),
                 "Writing {$cursor['written']} of {$total} changed files · {$cursor['unchanged']} unchanged"
             );
+        }
+
+        // Pass 3: switch every staged file into place in one quick run (renames
+        // only — well under a second even for thousands of files), never split
+        // across chunks, then drop the replaced scripts from OPcache.
+        if ($cursor['pending'] !== []) {
+            UpdateProgress::stage('merge', 96, 'Switching ' . count($cursor['pending']) . ' updated files into place…');
+            foreach ($cursor['pending'] as $n => [$temp, $relative, $i]) {
+                $target = $destination . '/' . $relative;
+                $error = $this->swapIn($temp, $target);
+                if ($error !== null) {
+                    // What switched so far stays (it compares equal on a retry); the rest is retried.
+                    $cursor['pending'] = array_slice($cursor['pending'], $n);
+                    $this->saveManifest($destination, $manifest, $seen);
+
+                    return ['ok' => false, 'message' => "failed to replace '{$relative}' ({$error})", 'extracted' => $cursor['written'], 'written' => $cursor['written'], 'unchanged' => $cursor['unchanged']];
+                }
+                $stat = $zip->statIndex($i);
+                if ($stat !== false) {
+                    $seen[$relative] = $stat;
+                }
+                self::forgetCompiled($target);
+            }
+            $cursor['pending'] = [];
         }
 
         $this->saveManifest($destination, $manifest, $seen);
 
         return ['ok' => true, 'extracted' => $cursor['written'] + $cursor['unchanged'], 'written' => $cursor['written'], 'unchanged' => $cursor['unchanged']];
+    }
+
+    /**
+     * Moves a staged temp file over its target. rename() replaces the file in
+     * one step on Linux, macOS and Windows (MoveFileEx); when it is refused —
+     * a file Windows has open, a sticky folder — the bytes are copied over the
+     * target instead.
+     *
+     * @return string|null the error, or null on success
+     */
+    private function swapIn(string $temp, string $target): ?string
+    {
+        if (! is_file($temp)) {
+            // Already switched by an earlier attempt of this chunk (killed after the rename).
+            return is_file($target) ? null : 'the staged file is missing';
+        }
+        if (@rename($temp, $target)) {
+            return null;
+        }
+
+        $ok = @copy($temp, $target);
+        $error = $ok ? null : (error_get_last()['message'] ?? 'permission denied');
+        if ($ok) {
+            @unlink($temp);
+        }
+
+        return $error;
+    }
+
+    /**
+     * Drops a replaced script from OPcache, so the new code runs at once even
+     * where OPcache does not re-check timestamps (validate_timestamps=0 on
+     * production servers) or would only notice after revalidate_freq.
+     */
+    private static function forgetCompiled(string $path): void
+    {
+        if (str_ends_with($path, '.php') && Platform::functionEnabled('opcache_invalidate')) {
+            @opcache_invalidate($path, true);
+        }
+    }
+
+    /** Staged temp files of a merge that did not finish: removed, the targets keep their old content. */
+    private function discardStaged(array $job): void
+    {
+        $destination = rtrim(base_path(), '/\\');
+        foreach ((array) ($job['merge']['pending'] ?? []) as $entry) {
+            $temp = $entry[0] ?? null;
+            if (is_string($temp) && str_starts_with(basename($temp), '.subandl-') && str_starts_with($temp, $destination)) {
+                @unlink($temp);
+            }
+        }
     }
 
     /**
@@ -1640,21 +1943,22 @@ class UpdateApplier
      * Writes one entry with as few file operations as each case needs:
      *
      *  - a NEW file is written straight to its place: nothing can be reading it;
-     *  - on Linux/macOS an EXISTING file is replaced through a temp file next to
-     *    it + rename(), so a request running mid-update never reads half a file,
-     *    and only the folder needs to be writable (a file owned by another
-     *    account — FTP, a deploy user — is replaced too; extractTo() fails on
-     *    those, as it also sets the mtime, which only the owner may);
-     *  - on Windows an existing file is overwritten in place: one operation
-     *    instead of create + rename, each of which Windows Defender scans, and
-     *    no permissions to carry over.
+     *  - an EXISTING file gets its new content in a temp file next to it
+     *    ($staged), switched in later together with all the others (see
+     *    extractZipSafely() Pass 3), so a request running mid-update never reads
+     *    half a file nor a mix of old and new files for long. Only the folder
+     *    needs to be writable (a file owned by another account — FTP, a deploy
+     *    user — is replaced too; extractTo() fails on those);
+     *  - when the folder is not writable, the file is overwritten in place.
      *
      * Entries up to 8 MB are read in one call; bigger ones are streamed.
      *
+     * @param string|null $staged  set to the temp file to switch in, or null when the target was written directly
      * @return string|null the error, or null on success
      */
-    private function extractEntry(ZipArchive $zip, int $index, string $target, array $stat): ?string
+    private function extractEntry(ZipArchive $zip, int $index, string $target, array $stat, ?string &$staged = null): ?string
     {
+        $staged = null;
         if (str_ends_with($stat['name'], '/')) {
             return is_dir($target) || @mkdir($target, 0755, true) ? null : 'could not create directory';
         }
@@ -1681,8 +1985,7 @@ class UpdateApplier
         }
 
         try {
-            $exists = is_file($target);
-            if (! $exists || Platform::isWindows()) {
+            if (! is_file($target)) {
                 return $this->writeFile($target, $source, $size);
             }
 
@@ -1705,16 +2008,12 @@ class UpdateApplier
                 return $this->writeFile($target, $source, $size);
             }
 
-            @chmod($temp, fileperms($target) & 0777);
-            if (@rename($temp, $target)) {
-                return null;
+            if (! Platform::isWindows()) {
+                @chmod($temp, fileperms($target) & 0777);
             }
+            $staged = $temp;
 
-            // Rename refused (sticky folder, target is a directory…): overwrite in place.
-            $ok = @copy($temp, $target);
-            @unlink($temp);
-
-            return $ok ? null : (error_get_last()['message'] ?? 'permission denied');
+            return null;
         } finally {
             if (is_resource($source)) {
                 fclose($source);
